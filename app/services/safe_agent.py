@@ -30,11 +30,14 @@ from app.models import (
     AgentCommandTestResponse,
     AgentEvent,
     AgentMemoryCreateRequest,
+    MockTestGenerateRequest,
     StudyGenerateRequest,
 )
+from app.services.agent_intent import AgentIntentParser
 from app.services.desktop import SAFE_TARGETS, DesktopActionService, DesktopTarget
 from app.services.documents import DocumentService
 from app.services.memory import MemoryService
+from app.services.mock_tests import MockTestService, MockTestSourceMaterialError
 from app.services.reports import ReportService
 from app.services.study import StudyService
 from app.services.voice import VoiceService
@@ -82,6 +85,7 @@ class SafeAgentService:
         memory: MemoryService,
         documents: DocumentService,
         study: StudyService,
+        mock_tests: MockTestService,
         desktop: DesktopActionService,
         voice: VoiceService,
     ):
@@ -90,9 +94,11 @@ class SafeAgentService:
         self.memory = memory
         self.documents = documents
         self.study = study
+        self.mock_tests = mock_tests
         self.desktop = desktop
         self.voice = voice
         self.llm = study.llm
+        self.intent_parser = AgentIntentParser(settings, self.llm)
 
         self.backend_dir = Path(__file__).resolve().parents[2]
         self.project_root = self.backend_dir.parent
@@ -156,6 +162,10 @@ class SafeAgentService:
         if unsafe:
             return unsafe
 
+        mock_follow_up = self._resolve_mock_test_follow_up(text, normalized, confirmed)
+        if mock_follow_up:
+            return mock_follow_up
+
         saved = self._resolve_saved_correction(text, normalized, confirmed)
         if saved:
             return saved
@@ -175,19 +185,28 @@ class SafeAgentService:
         return self._resolve_fuzzy_candidate(text, normalized, confirmed)
 
     async def resolve_request_from_text(self, text: str, confirmed: bool = False) -> AgentCommandRequest | None:
-        request = self.request_from_text(text, confirmed=confirmed)
-        if request:
-            return request
         normalized = self._normalize(text)
         if not normalized:
             return None
+
+        unsafe = self._unsafe_request(text, normalized, confirmed)
+        if unsafe:
+            return unsafe
+
+        semantic = await self.intent_parser.resolve(text, normalized, confirmed, set(self.commands))
+        if semantic:
+            return semantic
+
+        request = self.request_from_text(text, confirmed=confirmed)
+        if request:
+            return request
         return await self._resolve_with_llm(text, normalized, confirmed)
 
     def _unsafe_request(self, text: str, normalized: str, confirmed: bool) -> AgentCommandRequest | None:
         destructive = ("delete", "remove", "wipe", "erase", "rm", "rmdir", "format")
-        control = ("click", "type", "move", "close", "control", "press", "shell", "terminal", "cmd", "powershell", "secret", "api key")
+        control = ("click", "type", "move", "close", "control", "press", "shell", "terminal", "cmd", "powershell", "api key")
         memory_scoped = "memory" in normalized or self._has_fuzzy_word(normalized, ("memory",), threshold=84)
-        if self._has_fuzzy_word(normalized, destructive, threshold=78) and not memory_scoped:
+        if self._has_unsafe_word(normalized, destructive, threshold=82) and not memory_scoped:
             return AgentCommandRequest(
                 command_id="blocked_action",
                 input_text=text,
@@ -195,7 +214,7 @@ class SafeAgentService:
                 confirmed=confirmed,
                 resolution=self._resolution_meta("safety", 1.0, "destructive", normalized),
             )
-        if self._has_fuzzy_word(normalized, control, threshold=82):
+        if self._has_unsafe_word(normalized, control, threshold=82):
             return AgentCommandRequest(
                 command_id="blocked_action",
                 input_text=text,
@@ -205,10 +224,33 @@ class SafeAgentService:
             )
         return None
 
+    def _resolve_mock_test_follow_up(self, text: str, normalized: str, confirmed: bool) -> AgentCommandRequest | None:
+        if not self._mentions_mock_test(normalized):
+            return None
+        if self._is_mock_generation_intent(normalized):
+            return None
+        if not self._is_mock_existing_intent(normalized):
+            return None
+
+        topic = self._extract_existing_mock_topic(text)
+        resolution = self._resolution_meta("intent", 1.0, "mock test follow-up", normalized)
+        resolution["intent"] = "open_existing_tool"
+        if topic:
+            resolution["topic"] = topic
+        return AgentCommandRequest(
+            command_id="open_latest_mock_test",
+            input_text=text,
+            params={"topic": topic} if topic else {},
+            confirmed=confirmed,
+            resolution=resolution,
+        )
+
     def _resolve_exact_candidate(self, text: str, normalized: str, confirmed: bool) -> AgentCommandRequest | None:
         best: tuple[int, IntentCandidate, str] | None = None
         for candidate in self.intent_candidates:
             if candidate.command_id == "open_allowlisted_target" and not self._open_candidate_allowed(normalized):
+                continue
+            if candidate.command_id == "generate_mock_test" and not self._is_mock_generation_intent(normalized):
                 continue
             for alias in candidate.aliases:
                 alias_normalized = self._normalize(alias)
@@ -252,6 +294,9 @@ class SafeAgentService:
         candidates = self._llm_candidates()
         system_prompt = (
             "You resolve a user's agent prompt to one existing safe command. "
+            "First classify whether the user wants a new command, a status check, a complaint, a follow-up, or chat. "
+            "For mock-test status/complaint prompts like 'where is my mock test' or 'mock not created', choose open_latest_mock_test, not generate_mock_test. "
+            "Choose generate_mock_test only when the user clearly asks to create, generate, make, build, or prepare a new test. "
             "Return strict JSON only. Do not invent command IDs or executable strings. "
             "If no candidate fits, return command_id null."
         )
@@ -292,6 +337,25 @@ class SafeAgentService:
         matched_alias = str(payload.get("matched_alias") or payload.get("reason") or "llm")
         resolution = self._resolution_meta("llm", confidence, matched_alias, normalized)
         resolution["reason"] = str(payload.get("reason") or "")[:180]
+
+        if command_id == "generate_mock_test" and not self._is_mock_generation_intent(normalized):
+            if self._is_mock_existing_intent(normalized):
+                topic = self._extract_existing_mock_topic(text)
+                resolution["intent"] = "open_existing_tool"
+                return AgentCommandRequest(
+                    command_id="open_latest_mock_test",
+                    input_text=text,
+                    params={"topic": topic} if topic else {},
+                    confirmed=confirmed,
+                    resolution=resolution,
+                )
+            return None
+
+        if command_id == "clarify_agent_intent" and not re.search(
+            r"\b(pyq|previous\s+year|past\s+paper|official\s+questions?|year\s+questions?)\b",
+            normalized,
+        ):
+            return None
 
         if command_id not in self.commands:
             return AgentCommandRequest(command_id=str(command_id), input_text=text, params=params, confirmed=confirmed, resolution=resolution)
@@ -399,6 +463,8 @@ class SafeAgentService:
         best = (0, "")
         if candidate.command_id == "open_allowlisted_target":
             return self._open_target_score(normalized, str(candidate.params.get("target", "")))
+        if candidate.command_id == "generate_mock_test" and not self._is_mock_generation_intent(normalized):
+            return 0, ""
 
         for alias in candidate.aliases:
             alias_normalized = self._normalize(alias)
@@ -433,6 +499,15 @@ class SafeAgentService:
         elif candidate.command_id == "generate_study_artifact":
             topic = self._extract_study_topic(text, matched_alias)
             params = {**params, "topic": topic or text.strip()}
+        elif candidate.command_id == "generate_mock_test":
+            topic = self._extract_mock_test_topic(text, matched_alias)
+            params = {
+                "topic": topic or text.strip(),
+                "question_count": int(params.get("question_count", 10)),
+                "difficulty": str(params.get("difficulty", "mixed")),
+                "mode": "mcq",
+                "duration_minutes": int(params.get("duration_minutes", 20)),
+            }
 
         resolution = self._resolution_meta(source, confidence, matched_alias, normalized)
         if needs_confirmation:
@@ -494,6 +569,67 @@ class SafeAgentService:
     def _looks_like_question(self, normalized: str) -> bool:
         return bool(re.search(r"\b(what|why|how|when|where|who|explain|tell me|search for)\b", normalized))
 
+    def _mentions_mock_test(self, normalized: str) -> bool:
+        compact = self._compact(normalized)
+        if "mocktest" in compact or "mockexam" in compact or "practicetest" in compact:
+            return True
+        if re.search(r"\b(mock|exam|practice)\b", normalized):
+            return True
+        if self._is_assessment_generation_intent(normalized):
+            return True
+        if re.search(r"\btest\b", normalized) and re.search(r"\b(create|generate|make|build|prepare|new|another|creat|genrate|mak)\b", normalized):
+            return not re.search(r"\b(frontend|backend|pytest|lint|unit|integration)\b", normalized)
+        return False
+
+    def _is_mock_generation_intent(self, normalized: str) -> bool:
+        if not self._mentions_mock_test(normalized):
+            return False
+        if re.search(r"\b(not created|not generated|did not create|didnt create|not showing|till now|where|show|open|view|see|find)\b", normalized):
+            return False
+        if self._is_assessment_generation_intent(normalized):
+            return True
+        return bool(re.search(r"\b(create|generate|make|build|prepare|new|another|creat|genrate|generte|mak|preprare)\b", normalized))
+
+    def _is_assessment_generation_intent(self, normalized: str) -> bool:
+        if re.search(r"\b(frontend|backend|pytest|lint|unit|integration)\b", normalized):
+            return False
+        if re.search(r"\b(test|quiz|assess|challenge)\s+(me|my knowledge)?\b", normalized):
+            return True
+        if re.search(r"\b(ask|give)\s+(me\s+)?(some\s+|a\s+)?(questions?|mcqs?|quiz)\b", normalized):
+            return True
+        return False
+
+    def _is_mock_existing_intent(self, normalized: str) -> bool:
+        if not self._mentions_mock_test(normalized):
+            return False
+        status_markers = (
+            "where",
+            "show",
+            "open",
+            "view",
+            "see",
+            "find",
+            "latest",
+            "created",
+            "generated",
+            "available",
+            "missing",
+            "not created",
+            "not generated",
+            "did not create",
+            "didnt create",
+            "not showing",
+            "till now",
+            "yet",
+            "done",
+            "ready",
+        )
+        return any(marker in normalized for marker in status_markers)
+
+    def _mock_topic_looks_like_status(self, topic: str) -> bool:
+        normalized = self._normalize(topic)
+        return bool(re.search(r"\b(not created|not generated|did not create|didnt create|not showing|till now|where|show|open|view|see|find)\b", normalized))
+
     def _extract_memory_text(self, text: str, matched_alias: str) -> str:
         cleaned = re.sub(r"^\s*(please\s+)?(remember|rember|remeber|save memory|add memory|memorize|memo)\b\s*", "", text.strip(), flags=re.IGNORECASE)
         if cleaned == text.strip() and matched_alias:
@@ -509,6 +645,44 @@ class SafeAgentService:
         ).strip(" .")
         if cleaned == text.strip() and matched_alias:
             cleaned = re.sub(rf"^\s*(please\s+)?{re.escape(matched_alias)}\s*(for|on|about)?\s*", "", text.strip(), flags=re.IGNORECASE).strip(" .")
+        return cleaned
+
+    def _extract_mock_test_topic(self, text: str, matched_alias: str) -> str:
+        cleaned = re.sub(
+            r"^\s*(please\s+)?(generate|create|make|build|prepare|genrate|creat|mak)\s+(me\s+)?(a\s+|another\s+|new\s+)?(mock\s+test|practice\s+test|mock\s+exam|test|exam)\s*(for|on|about|of)?\s*",
+            "",
+            text.strip(),
+            flags=re.IGNORECASE,
+        ).strip(" .")
+        cleaned = re.sub(
+            r"^\s*(please\s+)?(test|quiz|assess|challenge)\s+(me|my knowledge)?\s*(on|about|in|for)?\s*",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        ).strip(" .")
+        cleaned = re.sub(
+            r"^\s*(please\s+)?(ask|give)\s+(me\s+)?(some\s+|a\s+)?(questions?|mcqs?|quiz|test)\s*(on|about|in|for)?\s*",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        ).strip(" .")
+        cleaned = re.sub(
+            r"^\s*(please\s+)?(make|create|generate|build|prepare|genrate|creat|mak)\s+(another\s+|new\s+)?(?P<topic>.+?)\s+(mock\s+test|practice\s+test|mock\s+exam|test|exam)\s*$",
+            lambda match: match.group("topic"),
+            cleaned,
+            flags=re.IGNORECASE,
+        ).strip(" .")
+        cleaned = re.sub(r"\b(current affairs?)\s+(on|about|for)\s+(the\s+)?topic\s+", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\b(current affairs?)\s+(on|about|for)\s+", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\b(on|about|for)\s+(the\s+)?topic\s+", "", cleaned, flags=re.IGNORECASE)
+        if cleaned == text.strip() and matched_alias:
+            cleaned = re.sub(rf"^\s*(please\s+)?{re.escape(matched_alias)}\s*(for|on|about|of)?\s*", "", text.strip(), flags=re.IGNORECASE).strip(" .")
+        return cleaned
+
+    def _extract_existing_mock_topic(self, text: str) -> str:
+        cleaned = self._normalize(text)
+        cleaned = re.sub(r"\b(where|is|are|my|the|latest|show|open|view|see|find|please|mock|test|exam|practice|created|generated|available|missing|not|did|didnt|create|showing|till|now|yet|done|ready)\b", " ", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
         return cleaned
 
     def _has_fuzzy_word(self, normalized: str, aliases: tuple[str, ...], threshold: int) -> bool:
@@ -533,6 +707,74 @@ class SafeAgentService:
             if any(len(word) > 3 and self._alias_score(word, alias_normalized) >= threshold for word in words):
                 return True
         return False
+
+    def _has_unsafe_word(self, normalized: str, aliases: tuple[str, ...], threshold: int) -> bool:
+        variants = tuple(
+            dict.fromkeys(
+                variant
+                for variant in (
+                    normalized,
+                    self._squash_repeats(normalized, 2),
+                    self._squash_repeats(normalized, 1),
+                )
+                if variant
+            )
+        )
+        words = [word for variant in variants for word in variant.split()]
+        if not words:
+            return False
+
+        for alias in aliases:
+            alias_normalized = self._normalize(alias)
+            alias_variants = tuple(
+                dict.fromkeys(
+                    variant
+                    for variant in (
+                        alias_normalized,
+                        self._squash_repeats(alias_normalized, 2),
+                        self._squash_repeats(alias_normalized, 1),
+                    )
+                    if variant
+                )
+            )
+
+            if " " in alias_normalized:
+                if any(alias_variant in variant for variant in variants for alias_variant in alias_variants):
+                    return True
+                window_size = len(alias_normalized.split())
+                if any(self._unsafe_alias_score(window, alias_normalized) >= threshold for window in self._token_windows(words, window_size)):
+                    return True
+                continue
+
+            if alias_normalized in words:
+                return True
+            if len(alias_normalized) <= 3:
+                continue
+            if any(len(word) > 3 and self._unsafe_alias_score(word, alias_normalized) >= threshold for word in words):
+                return True
+        return False
+
+    def _unsafe_alias_score(self, text: str, alias: str) -> int:
+        text_variants = (
+            text,
+            self._squash_repeats(text, 2),
+            self._squash_repeats(text, 1),
+        )
+        alias_variants = (
+            alias,
+            self._squash_repeats(alias, 2),
+            self._squash_repeats(alias, 1),
+        )
+        best = 0
+        for text_variant in dict.fromkeys(variant for variant in text_variants if variant):
+            for alias_variant in dict.fromkeys(variant for variant in alias_variants if variant):
+                if text_variant == alias_variant:
+                    best = max(best, 100)
+                elif fuzz:
+                    best = max(best, int(max(fuzz.ratio(text_variant, alias_variant), fuzz.WRatio(text_variant, alias_variant), fuzz.token_set_ratio(text_variant, alias_variant))))
+                else:
+                    best = max(best, int(SequenceMatcher(None, text_variant, alias_variant).ratio() * 100))
+        return min(best, 100)
 
     def _score(self, text: str, alias: str) -> int:
         if fuzz:
@@ -806,6 +1048,8 @@ class SafeAgentService:
         source = resolution.get("source")
         if source in {"fuzzy", "llm", "correction"}:
             return f"I understood \"{resolution.get('normalized_prompt', '')}\" as {self._resolved_label(command, params)}. {message}"
+        if source in {"semantic_llm", "semantic_local"} and command.id == "generate_mock_test":
+            return f"I understood this as {self._resolved_label(command, params)}. {message}"
         return message
 
     def _resolved_label(self, command: AgentCommandDefinition, params: dict[str, Any]) -> str:
@@ -817,6 +1061,12 @@ class SafeAgentService:
         if command.id == "generate_study_artifact":
             artifact = str(params.get("artifact_type", "study artifact")).replace("_", " ")
             return f"Generate {artifact.title()}"
+        if command.id == "generate_mock_test":
+            topic = str(params.get("topic") or "topic").strip()
+            return f"Generate Mock Test for {topic}"
+        if command.id == "open_latest_mock_test":
+            topic = str(params.get("topic") or "").strip()
+            return f"Open Latest Mock Test for {topic}" if topic else "Open Latest Mock Test"
         return command.label
 
     def _build_commands(self) -> dict[str, AgentCommandDefinition]:
@@ -874,6 +1124,25 @@ class SafeAgentService:
                 risk="safe_auto",
                 executor=self._exec_list_study_artifacts,
                 tester=self._test_study_ready,
+            ),
+            AgentCommandDefinition(
+                id="list_mock_tests",
+                label="List Mock Tests",
+                description="List generated mock tests.",
+                category="Study",
+                risk="safe_auto",
+                executor=self._exec_list_mock_tests,
+                tester=self._test_mock_tests_ready,
+            ),
+            AgentCommandDefinition(
+                id="open_latest_mock_test",
+                label="Open Latest Mock Test",
+                description="Return the latest generated mock test so the UI can open it.",
+                category="Study",
+                risk="safe_auto",
+                params_schema={"topic": {"type": "string"}},
+                executor=self._exec_open_latest_mock_test,
+                tester=self._test_mock_tests_ready,
             ),
             AgentCommandDefinition(
                 id="list_memory",
@@ -967,6 +1236,40 @@ class SafeAgentService:
                 tester=self._test_study_ready,
             ),
             AgentCommandDefinition(
+                id="generate_mock_test",
+                label="Generate Mock Test",
+                description="Create a local MCQ mock test from a topic or source-backed PYQ material.",
+                category="Study",
+                risk="safe_confirm",
+                params_schema={
+                    "topic": {"type": "string"},
+                    "exam": {"type": "string"},
+                    "subject": {"type": "string"},
+                    "question_count": {"type": "integer", "default": 10},
+                    "difficulty": {"type": "string", "enum": ["easy", "medium", "hard", "mixed"]},
+                    "mode": {"type": "string", "enum": ["mcq"]},
+                    "duration_minutes": {"type": "integer", "default": 20},
+                    "source_requirement": {"type": "string", "enum": ["none", "pyq_required", "source_backed"]},
+                    "source_mode": {"type": "string", "enum": ["uploaded_docs"]},
+                    "source_query": {"type": "string"},
+                    "constraints": {"type": "array"},
+                },
+                required_params=("topic",),
+                executor=self._exec_generate_mock_test,
+                tester=self._test_mock_tests_ready,
+            ),
+            AgentCommandDefinition(
+                id="clarify_agent_intent",
+                label="Clarify Agent Intent",
+                description="Ask for a safe clarification before running a source-sensitive action.",
+                category="Safety",
+                risk="safe_auto",
+                params_schema={"message": {"type": "string"}, "actions": {"type": "array"}},
+                required_params=("message",),
+                executor=self._exec_clarify_agent_intent,
+                tester=self._test_backend_ready,
+            ),
+            AgentCommandDefinition(
                 id="blocked_action",
                 label="Blocked Action",
                 description="Reject unsafe free-form desktop, shell, secret, or destructive requests.",
@@ -981,7 +1284,11 @@ class SafeAgentService:
 
     async def _exec_backend_health(self, _: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
         providers = self._provider_status()
-        return True, "Backend is online and provider status is ready.", {"model": self.settings.cerebras_model, "providers": providers}
+        return True, "Backend is online and provider status is ready.", {
+            "model": self.settings.resolved_cerebras_pro_model,
+            "models": self.settings.cerebras_models,
+            "providers": providers,
+        }
 
     async def _exec_provider_setup(self, _: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
         providers = self._provider_status()
@@ -1007,6 +1314,24 @@ class SafeAgentService:
     async def _exec_list_study_artifacts(self, _: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
         artifacts = [self._artifact_summary(item) for item in self.study.list_artifacts()]
         return True, f"Found {len(artifacts)} study artifacts.", {"artifacts": artifacts}
+
+    async def _exec_list_mock_tests(self, _: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
+        tests = [item.model_dump(mode="json") for item in self.mock_tests.list_tests()]
+        return True, f"Found {len(tests)} mock tests.", {"mock_tests": tests, "mock_test": tests[0] if tests else None}
+
+    async def _exec_open_latest_mock_test(self, params: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
+        tests = self.mock_tests.list_tests()
+        topic = str(params.get("topic") or "").strip()
+        selected = self._select_mock_test(tests, topic)
+        data = {"mock_tests": [item.model_dump(mode="json") for item in tests[:10]], "open_panel": "mock_test"}
+        if not selected:
+            suffix = f" for {topic}" if topic else ""
+            return True, f"I could not find a saved mock test{suffix} yet.", {**data, "mock_test": None}
+        selected_data = selected.model_dump(mode="json")
+        selected_topic = "" if self._mock_topic_looks_like_status(str(selected.topic)) else selected.topic
+        topic_label = topic or selected_topic
+        label = f" related to {topic_label}" if topic_label else ""
+        return True, f"I found your latest mock test{label}. Opening Mock Test.", {**data, "mock_test": selected_data}
 
     async def _exec_list_memory(self, _: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
         items = [item.model_dump(mode="json") for item in self.memory.list_items()]
@@ -1077,6 +1402,36 @@ class SafeAgentService:
         artifact, setup = await self.study.generate(request)
         return True, f"Generated {artifact.artifact_type.replace('_', ' ')} for {request.topic}.", {"artifact": artifact.model_dump(mode="json"), "setup_required": setup}
 
+    async def _exec_generate_mock_test(self, params: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
+        request = MockTestGenerateRequest(
+            topic=params["topic"],
+            exam=params.get("exam", ""),
+            subject=params.get("subject", ""),
+            question_count=int(params.get("question_count", 10)),
+            difficulty=params.get("difficulty", "mixed"),
+            mode="mcq",
+            duration_minutes=int(params.get("duration_minutes", 20)),
+            source_requirement=params.get("source_requirement", "none"),
+            source_mode="uploaded_docs",
+            source_query=params.get("source_query", ""),
+            constraints=params.get("constraints", []),
+        )
+        try:
+            test, setup = await self.mock_tests.generate(request)
+        except MockTestSourceMaterialError as exc:
+            return False, str(exc), {"setup_required": [], "source_actions": exc.source_actions}
+        except ValueError as exc:
+            return False, str(exc), {"setup_required": []}
+        return (
+            True,
+            f"Generated a {test.question_count}-question mock test for {test.topic}.",
+            {"mock_test": test.model_dump(mode="json"), "setup_required": setup},
+        )
+
+    async def _exec_clarify_agent_intent(self, params: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
+        actions = params.get("actions") if isinstance(params.get("actions"), list) else []
+        return True, str(params["message"]), {"actions": actions, "topic": params.get("topic", "")}
+
     async def _run_fixed_command(self, argv: list[str], cwd: Path, label: str) -> tuple[bool, str, dict[str, Any]]:
         if not cwd.exists():
             return False, f"{label} cannot run because {cwd} does not exist.", {"cwd": str(cwd)}
@@ -1117,6 +1472,9 @@ class SafeAgentService:
 
     async def _test_study_ready(self) -> tuple[bool, str]:
         return (self.study.study_dir.exists(), "Study artifact directory is available.")
+
+    async def _test_mock_tests_ready(self) -> tuple[bool, str]:
+        return (self.mock_tests.mock_tests_dir.exists(), "Mock test directory is available.")
 
     async def _test_memory_ready(self) -> tuple[bool, str]:
         return (self.memory.memory_dir.exists(), "Memory store is available.")
@@ -1175,6 +1533,13 @@ class SafeAgentService:
                 return clean, "Only valid http(s) URLs can be opened."
             clean["url"] = url
 
+        if command.id == "open_latest_mock_test":
+            topic = str(clean.get("topic", "")).strip(" .")
+            if topic:
+                clean["topic"] = topic
+            elif "topic" in clean:
+                clean.pop("topic", None)
+
         if command.id == "save_memory":
             text = str(clean.get("text", "")).strip()
             if not text:
@@ -1192,6 +1557,41 @@ class SafeAgentService:
             clean["topic"] = str(clean.get("topic", "")).strip()
             if not clean["topic"]:
                 return clean, "Study artifact topic cannot be empty."
+
+        if command.id == "generate_mock_test":
+            clean["topic"] = str(clean.get("topic", "")).strip(" .")
+            if not clean["topic"]:
+                return clean, "Mock test topic cannot be empty."
+            if self._mock_topic_looks_like_status(clean["topic"]):
+                return clean, "That looks like a mock-test status request, not a new test topic."
+            clean["exam"] = str(clean.get("exam") or "").strip(" .")[:80]
+            clean["subject"] = str(clean.get("subject") or "").strip(" .")[:80]
+            try:
+                clean["question_count"] = max(1, min(50, int(clean.get("question_count", 10))))
+            except (TypeError, ValueError):
+                clean["question_count"] = 10
+            difficulty = str(clean.get("difficulty", "mixed")).strip().lower()
+            clean["difficulty"] = difficulty if difficulty in {"easy", "medium", "hard", "mixed"} else "mixed"
+            clean["mode"] = "mcq"
+            try:
+                clean["duration_minutes"] = max(1, min(180, int(clean.get("duration_minutes", 20))))
+            except (TypeError, ValueError):
+                clean["duration_minutes"] = 20
+            source_requirement = str(clean.get("source_requirement", "none")).strip().lower()
+            clean["source_requirement"] = source_requirement if source_requirement in {"none", "pyq_required", "source_backed"} else "none"
+            clean["source_mode"] = "uploaded_docs"
+            clean["source_query"] = str(clean.get("source_query") or "").strip()[:240]
+            constraints = clean.get("constraints")
+            clean["constraints"] = [str(item).strip()[:80] for item in constraints if str(item).strip()] if isinstance(constraints, list) else []
+
+        if command.id == "clarify_agent_intent":
+            message = str(clean.get("message", "")).strip()
+            if not message:
+                return clean, "Clarification message cannot be empty."
+            clean["message"] = message
+            actions = clean.get("actions")
+            clean["actions"] = [str(item).strip()[:80] for item in actions if str(item).strip()] if isinstance(actions, list) else []
+            clean["topic"] = str(clean.get("topic", "")).strip(" .")
 
         return clean, None
 
@@ -1357,6 +1757,21 @@ class SafeAgentService:
         add("open_latest_report", "Open Latest Report", ("open latest report", "show latest report", "view latest report", "latest report"))
         add("list_documents", "List Documents", ("list documents", "show documents", "uploaded documents", "pdf documents"))
         add("list_study_artifacts", "List Study Artifacts", ("list study artifacts", "show study artifacts", "study artifacts", "study materials"))
+        add("list_mock_tests", "List Mock Tests", ("list mock tests", "show mock tests", "all mock tests", "saved mock tests", "mock tests"))
+        add(
+            "open_latest_mock_test",
+            "Open Latest Mock Test",
+            (
+                "open mock test",
+                "show mock test",
+                "view mock test",
+                "where is my mock test",
+                "latest mock test",
+                "mock test not created",
+                "mock not created",
+                "find mock test",
+            ),
+        )
         add("list_memory", "List Memory", ("list memory", "show memory", "saved memory", "memories"))
         add("run_frontend_lint", "Run Frontend Lint", ("run frontend lint", "frontend lint", "npm lint", "lint frontend"))
         add("run_backend_tests", "Run Backend Tests", ("run backend tests", "backend tests", "pytest", "run pytest"))
@@ -1367,6 +1782,23 @@ class SafeAgentService:
         add("generate_study_artifact", "Generate Quiz", ("generate quiz", "create quiz", "make quiz", "quiz", "quizz"), {"artifact_type": "quiz"})
         add("generate_study_artifact", "Generate Revision Plan", ("generate revision plan", "create revision plan", "make revision plan", "revision plan"), {"artifact_type": "revision_plan"})
         add("generate_study_artifact", "Generate Viva Questions", ("generate viva questions", "create viva questions", "make viva questions", "viva questions", "viva"), {"artifact_type": "viva_questions"})
+        add(
+            "generate_mock_test",
+            "Generate Mock Test",
+            (
+                "create mock test",
+                "generate mock test",
+                "make mock test",
+                "mock test",
+                "mock exam",
+                "practice test",
+                "create practice test",
+                "generate practice test",
+                "make test",
+                "create test",
+            ),
+            {"question_count": 10, "difficulty": "mixed", "mode": "mcq", "duration_minutes": 20},
+        )
         return candidates
 
     def _llm_candidates(self) -> list[dict[str, Any]]:
@@ -1446,6 +1878,33 @@ class SafeAgentService:
             "created_at": artifact.created_at.isoformat(),
             "markdown": artifact.markdown[:1200],
         }
+
+    def _select_mock_test(self, tests: list[Any], topic: str) -> Any | None:
+        if not tests:
+            return None
+        clean_tests = [test for test in tests if not self._mock_topic_looks_like_status(str(getattr(test, "topic", "")))]
+        tests = clean_tests or tests
+        topic = self._normalize(topic)
+        if not topic:
+            return tests[0] if clean_tests else None
+        topic_compact = self._compact(topic)
+        best: tuple[int, int, Any] | None = None
+        for test in tests:
+            test_topic = self._normalize(str(getattr(test, "topic", "")))
+            test_compact = self._compact(test_topic)
+            if test_compact == topic_compact:
+                score = 120
+            else:
+                score = self._alias_score(test_topic, topic)
+                if len(topic_compact) <= 4 and topic_compact and topic_compact in test_compact:
+                    score = min(score, 78)
+                score -= min(20, max(0, len(test_compact) - len(topic_compact)) // 3)
+            length_delta = abs(len(test_compact) - len(topic_compact))
+            if best is None or score > best[0] or (score == best[0] and length_delta < best[1]):
+                best = (score, length_delta, test)
+        if best and best[0] >= 68:
+            return best[2]
+        return None
 
     async def _url_responds(self, url: str) -> bool:
         try:

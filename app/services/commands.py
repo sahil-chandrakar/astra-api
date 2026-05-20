@@ -15,6 +15,7 @@ from app.models import (
 from app.services.agents import AstraAgentSystem
 from app.services.desktop import DesktopActionService
 from app.services.reports import ReportService
+from app.services.research import ResearchService
 from app.services.safe_agent import SafeAgentService
 
 
@@ -41,11 +42,13 @@ class CommandService:
         desktop_actions: DesktopActionService,
         reports: ReportService,
         safe_agent: SafeAgentService,
+        research_service: ResearchService | None = None,
     ):
         self.agent_system = agent_system
         self.desktop_actions = desktop_actions
         self.reports = reports
         self.safe_agent = safe_agent
+        self.research_service = research_service
 
     async def handle(self, request: CommandRequest) -> CommandResponse:
         text = request.text.strip()
@@ -53,9 +56,9 @@ class CommandService:
         if requested_mode:
             return self._mode_switch_response(requested_mode)
 
-        if request.mode == "agents":
+        if request.mode == "agents" or self._looks_like_mock_test_intent(text):
             agent_response = await self.safe_agent.handle_natural_language(text, confirmed=request.confirmed)
-            if agent_response:
+            if agent_response and (request.mode == "agents" or agent_response.command_id in {"generate_mock_test", "open_latest_mock_test", "list_mock_tests"}):
                 return self._agent_command_response(agent_response, request.mode)
 
         desktop_target = self.desktop_actions.detect(text)
@@ -66,13 +69,16 @@ class CommandService:
             return await self._research_response(request)
 
         if request.mode == "agents":
+            conversational = self._agent_conversation_response(text)
+            if conversational:
+                return conversational
             plan = self.desktop_actions.plan_message(text)
             if plan:
                 return self._agent_plan_response(plan, request.mode)
             chat_response = await self.agent_system.chat(text, "agents")
-            return self._chat_response(chat_response, request.mode, "agent_plan")
+            return self._chat_response(chat_response, request.mode, "chat")
 
-        chat_response = await self.agent_system.chat(text, "cockpit")
+        chat_response = await self.agent_system.chat(text, "cockpit", astra_pro=request.astra_pro)
         return self._chat_response(chat_response, "cockpit", "chat")
 
     def _mode_switch_response(self, mode: AppMode) -> CommandResponse:
@@ -121,6 +127,32 @@ class CommandService:
             agent_command=response,
         )
 
+    def _agent_conversation_response(self, text: str) -> CommandResponse | None:
+        normalized = self._normalize(text)
+        compact = re.sub(r"[^a-z0-9]+", "", normalized)
+        answer = ""
+
+        if compact in {"hi", "hii", "hiii", "hello", "helo", "hey", "heyy", "hallo", "yo"} or re.fullmatch(r"(hi+|he+y+|hello+|hlo+)", compact):
+            answer = "Hello! I'm Astra. How can I help?"
+        elif re.search(r"\b(what is your name|what's your name|who are you|your name)\b", normalized):
+            answer = "My name is Astra. I'm your voice-first AI assistant."
+        elif re.search(r"\b(how are you|how r you|how are u)\b", normalized):
+            answer = "I'm ready and online. What would you like to do?"
+        elif compact in {"thanks", "thankyou", "thanku", "ty"} or re.search(r"\b(thanks|thank you)\b", normalized):
+            answer = "You're welcome."
+
+        if not answer:
+            return None
+
+        event = AgentEvent(agent="Astra", status="complete", message="Conversational response ready.")
+        return CommandResponse(
+            mode="agents",
+            intent="chat",
+            spoken_text=answer,
+            display_text=answer,
+            events=[event],
+        )
+
     def _chat_response(self, response: ChatResponse, mode: AppMode, intent: str) -> CommandResponse:
         spoken = self._spoken_chat(response.answer)
         return CommandResponse(
@@ -136,12 +168,17 @@ class CommandService:
         depth = self._research_depth(request)
         topic = self._clean_research_topic(request.text)
         research_request = ResearchRequest(topic=topic, depth=depth, source_mode="mixed", require_citations=True)
-        response: ResearchResponse = await self.agent_system.research(research_request)
-        report = self.reports.save_research_report(research_request, response)
+        if self.research_service:
+            job = await self.research_service.run_to_completion(research_request, save_report=True)
+            response: ResearchResponse = self.research_service.to_research_response(job)
+            report = job.report
+        else:
+            response = await self.agent_system.research(research_request)
+            report = self.reports.save_research_report(research_request, response)
         percent = round(response.confidence * 100)
         source_count = len(response.citations)
         spoken = f"Research complete. I generated the report with {source_count} sources and {percent}% confidence."
-        display = f"{spoken} Report saved: {report.title}"
+        display = f"{spoken} Report saved: {report.title if report else topic}"
         return CommandResponse(
             mode="research",
             intent="research",
@@ -166,14 +203,24 @@ class CommandService:
 
     def _should_research(self, text: str, mode: AppMode) -> bool:
         normalized = self._normalize(text)
-        if mode == "research":
-            return True
         return bool(
             re.search(
                 r"\b(research|deep research|web search|search web|latest|sources?|citations?|papers?|study|studies|literature review|academic)\b",
                 normalized,
             )
         )
+
+    def _looks_like_mock_test_intent(self, text: str) -> bool:
+        normalized = self._normalize(text)
+        if re.search(r"\b(mock|mocktest|practice test|mock exam)\b", normalized):
+            return True
+        if re.search(r"\b(test|quiz|assess|challenge)\s+(me|my knowledge)?\b", normalized):
+            return not re.search(r"\b(frontend|backend|pytest|lint|unit|integration)\b", normalized)
+        if re.search(r"\b(ask|give)\s+(me\s+)?(some\s+|a\s+)?(questions?|mcqs?|quiz)\b", normalized):
+            return True
+        if re.search(r"\btest\b", normalized) and re.search(r"\b(create|generate|make|build|prepare|new|another)\b", normalized):
+            return not re.search(r"\b(frontend|backend|pytest|lint|unit|integration)\b", normalized)
+        return False
 
     def _research_depth(self, request: CommandRequest) -> ResearchDepth:
         normalized = self._normalize(request.text)

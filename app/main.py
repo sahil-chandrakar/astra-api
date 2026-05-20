@@ -2,7 +2,7 @@ import asyncio
 
 from fastapi import FastAPI, File, HTTPException, Response, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 
 from app.config import get_settings
 from app.models import (
@@ -10,9 +10,17 @@ from app.models import (
     AgentCommandTestRequest,
     AgentMemoryCreateRequest,
     AgentMemoryUpdateRequest,
+    AutomationCancelRequest,
+    AutomationConfirmRequest,
+    AutomationContinueRequest,
+    AutomationOpenPathRequest,
+    AutomationRecipeCreateRequest,
+    AutomationRunRequest,
     ChatRequest,
     CommandRequest,
     DocumentQuestionRequest,
+    MockTestGenerateRequest,
+    MockTestSubmitRequest,
     ResearchRequest,
     StudyGenerateRequest,
     VoiceSpeakRequest,
@@ -20,11 +28,14 @@ from app.models import (
     VoiceTranscriptionResponse,
 )
 from app.services.agents import AstraAgentSystem
+from app.services.automations import AutomationService
 from app.services.commands import CommandService
 from app.services.desktop import DesktopActionService
 from app.services.documents import DocumentService
 from app.services.memory import MemoryService
+from app.services.mock_tests import MockTestService
 from app.services.reports import ReportService
+from app.services.research import ResearchService
 from app.services.safe_agent import SafeAgentService
 from app.services.study import StudyService
 from app.services.voice import VoiceService
@@ -33,12 +44,16 @@ settings = get_settings()
 agent_system = AstraAgentSystem(settings)
 voice_service = VoiceService(settings)
 report_service = ReportService(settings)
+research_service = ResearchService(settings, agent_system.llm, agent_system.search, report_service)
+agent_system.research_service = research_service
 desktop_service = DesktopActionService()
 memory_service = MemoryService(settings)
 document_service = DocumentService(settings)
 study_service = StudyService(settings, report_service, document_service, agent_system.llm)
-safe_agent_service = SafeAgentService(settings, report_service, memory_service, document_service, study_service, desktop_service, voice_service)
-command_service = CommandService(agent_system, desktop_service, report_service, safe_agent_service)
+mock_test_service = MockTestService(settings, agent_system.llm, document_service, agent_system.search)
+safe_agent_service = SafeAgentService(settings, report_service, memory_service, document_service, study_service, mock_test_service, desktop_service, voice_service)
+automation_service = AutomationService(settings, agent_system.llm)
+command_service = CommandService(agent_system, desktop_service, report_service, safe_agent_service, research_service)
 
 app = FastAPI(title="Astra AI Agent API", version="0.1.0")
 
@@ -68,7 +83,8 @@ async def health() -> dict[str, object]:
     return {
         "status": "ok",
         "app": "Astra AI Agent API",
-        "model": settings.cerebras_model,
+        "model": settings.resolved_cerebras_pro_model,
+        "models": settings.cerebras_models,
         "providers": {
             "cerebras": settings.has_cerebras,
             "tavily": settings.has_tavily,
@@ -87,12 +103,33 @@ async def agents():
 
 @app.post("/api/chat")
 async def chat(request: ChatRequest):
-    return await agent_system.chat(request.message, request.mode)
+    return await agent_system.chat(request.message, request.mode, astra_pro=request.astra_pro)
 
 
 @app.post("/api/research")
 async def research(request: ResearchRequest):
-    return await agent_system.research(request)
+    job = await research_service.run_to_completion(request, save_report=False)
+    return research_service.to_research_response(job)
+
+
+@app.post("/api/research/jobs")
+async def start_research_job(request: ResearchRequest):
+    return research_service.start_job(request)
+
+
+@app.get("/api/research/jobs/{job_id}")
+async def get_research_job(job_id: str):
+    job = research_service.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Research job not found.")
+    return job
+
+
+@app.get("/api/research/jobs/{job_id}/events")
+async def research_job_events(job_id: str):
+    if not research_service.get_job(job_id):
+        raise HTTPException(status_code=404, detail="Research job not found.")
+    return StreamingResponse(research_service.stream_events(job_id), media_type="text/event-stream")
 
 
 @app.post("/api/command")
@@ -118,6 +155,74 @@ async def test_agent_commands(request: AgentCommandTestRequest | None = None):
 @app.get("/api/agent/audit")
 async def agent_audit():
     return safe_agent_service.audit_entries()
+
+
+@app.post("/api/automations/runs")
+async def start_automation_run(request: AutomationRunRequest):
+    return await automation_service.start_run(request)
+
+
+@app.get("/api/automations/runs/{run_id}")
+async def get_automation_run(run_id: str):
+    run = automation_service.get_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Automation run not found.")
+    return run
+
+
+@app.get("/api/automations/runs/{run_id}/events")
+async def automation_run_events(run_id: str):
+    if not automation_service.get_run(run_id):
+        raise HTTPException(status_code=404, detail="Automation run not found.")
+    return StreamingResponse(automation_service.stream_events(run_id), media_type="text/event-stream")
+
+
+@app.post("/api/automations/runs/{run_id}/continue")
+async def continue_automation_run(run_id: str, request: AutomationContinueRequest):
+    run = await automation_service.continue_run(run_id, request)
+    if not run:
+        raise HTTPException(status_code=404, detail="Automation run not found.")
+    return run
+
+
+@app.post("/api/automations/runs/{run_id}/confirm")
+async def confirm_automation_run(run_id: str, request: AutomationConfirmRequest):
+    run = await automation_service.confirm_run(run_id, request)
+    if not run:
+        raise HTTPException(status_code=404, detail="Automation run not found.")
+    return run
+
+
+@app.post("/api/automations/runs/{run_id}/cancel")
+async def cancel_automation_run(run_id: str, request: AutomationCancelRequest):
+    run = await automation_service.cancel_run(run_id, request)
+    if not run:
+        raise HTTPException(status_code=404, detail="Automation run not found.")
+    return run
+
+
+@app.post("/api/automations/open-download-folder")
+async def open_automation_download_folder(request: AutomationOpenPathRequest):
+    if not automation_service.open_download_path(request.path):
+        raise HTTPException(status_code=404, detail="Download folder not found.")
+    return {"ok": True}
+
+
+@app.get("/api/automations/recipes")
+async def automation_recipes():
+    return automation_service.list_recipes()
+
+
+@app.post("/api/automations/recipes")
+async def create_automation_recipe(request: AutomationRecipeCreateRequest):
+    return automation_service.create_recipe(request)
+
+
+@app.delete("/api/automations/recipes/{recipe_id}")
+async def delete_automation_recipe(recipe_id: str):
+    if not automation_service.delete_recipe(recipe_id):
+        raise HTTPException(status_code=404, detail="Automation recipe not found.")
+    return {"ok": True}
 
 
 @app.get("/api/memory")
@@ -176,6 +281,45 @@ async def generate_study_artifact(request: StudyGenerateRequest):
 @app.get("/api/study/artifacts")
 async def study_artifacts():
     return study_service.list_artifacts()
+
+
+@app.post("/api/mock-tests/generate")
+async def generate_mock_test(request: MockTestGenerateRequest):
+    try:
+        test, setup = await mock_test_service.generate(request)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"test": test, "setup_required": setup}
+
+
+@app.get("/api/mock-tests")
+async def mock_tests():
+    return mock_test_service.list_tests()
+
+
+@app.get("/api/mock-tests/{test_id}")
+async def mock_test(test_id: str):
+    test = mock_test_service.get_test(test_id)
+    if not test:
+        raise HTTPException(status_code=404, detail="Mock test not found.")
+    return test
+
+
+@app.post("/api/mock-tests/{test_id}/start")
+async def start_mock_test(test_id: str):
+    try:
+        test, attempt = mock_test_service.start_attempt(test_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"test": test, "attempt": attempt}
+
+
+@app.post("/api/mock-tests/{test_id}/attempts/{attempt_id}/submit")
+async def submit_mock_test(test_id: str, attempt_id: str, request: MockTestSubmitRequest):
+    try:
+        return mock_test_service.submit_attempt(test_id, attempt_id, request)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @app.get("/api/reports")

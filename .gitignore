@@ -19,6 +19,7 @@ venv/
 .cache/
 data/
 reports/
+tmp-*/
 
 # Logs
 *.log

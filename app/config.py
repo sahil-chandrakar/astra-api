@@ -1,6 +1,10 @@
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+BACKEND_ROOT = Path(__file__).resolve().parents[1]
 
 
 class Settings(BaseSettings):
@@ -8,7 +12,9 @@ class Settings(BaseSettings):
     tavily_api_key: str = ""
     semantic_scholar_api_key: str = ""
     frontend_origin: str = "http://localhost:3000"
-    cerebras_model: str = "llama3.1-8b"
+    cerebras_model: str = "zai-glm-4.7"
+    cerebras_fast_model: str = "llama3.1-8b"
+    cerebras_pro_model: str = ""
     voice_provider: str = "piper"
     piper_voice_id: str = "en_US-lessac-high"
     piper_cache_dir: str = ".cache/piper"
@@ -22,7 +28,7 @@ class Settings(BaseSettings):
     data_dir: str = "data"
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=str(BACKEND_ROOT / ".env"),
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -38,6 +44,21 @@ class Settings(BaseSettings):
     @property
     def wants_piper(self) -> bool:
         return self.voice_provider.strip().lower() == "piper"
+
+    @property
+    def resolved_cerebras_fast_model(self) -> str:
+        return self.cerebras_fast_model.strip() or "llama3.1-8b"
+
+    @property
+    def resolved_cerebras_pro_model(self) -> str:
+        return self.cerebras_pro_model.strip() or self.cerebras_model.strip() or "zai-glm-4.7"
+
+    @property
+    def cerebras_models(self) -> dict[str, str]:
+        return {
+            "fast": self.resolved_cerebras_fast_model,
+            "pro": self.resolved_cerebras_pro_model,
+        }
 
 
 @lru_cache
