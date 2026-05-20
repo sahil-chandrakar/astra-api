@@ -7,7 +7,7 @@ import sys
 import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote_plus, urlparse
@@ -24,6 +24,7 @@ from app.models import (
     AutomationRunRequest,
 )
 from app.services.llm import LlmService
+from app.services.windows_automation import WindowsAutomationResult, WindowsAutomationService
 
 
 class AutomationCancelledError(Exception):
@@ -40,6 +41,10 @@ ALLOWED_AUTOMATION_TOOLS = {
     "browser.download",
     "python.run_safe",
     "video.download_permitted",
+    "windows.set_alarm",
+    "windows.open_calculator",
+    "windows.open_file_explorer",
+    "windows.reject_destructive_file_action",
     "automation.save_recipe",
 }
 
@@ -69,12 +74,19 @@ PYTHON_BLOCKED_PATTERN = re.compile(
     r"\b(import\s+os|from\s+os|subprocess|shutil|socket|requests|urllib|pathlib|yt[-_]?dlp|youtube[-_]?dl|pytube|streamlink|ffmpeg|pip\s+install|curl|wget|open\s*\(\s*['\"][/A-Za-z]:|open\s*\(\s*['\"].*\.\.)\b",
     re.IGNORECASE,
 )
+WINDOWS_DESTRUCTIVE_FILE_PATTERN = re.compile(
+    r"\b(delete|remove|move|rename|format|wipe|empty\s+recycle\s+bin)\b.*\b(file|folder|directory|drive|explorer|path|desktop|downloads?|documents?)\b|"
+    r"\b(file|folder|directory|drive|explorer|path|desktop|downloads?|documents?)\b.*\b(delete|remove|move|rename|format|wipe)\b",
+    re.IGNORECASE,
+)
+CALCULATOR_EXPRESSION_PATTERN = re.compile(r"^[0-9+\-*/().%\s]+$")
 
 
 class AutomationService:
     def __init__(self, settings: Settings, llm: LlmService):
         self.settings = settings
         self.llm = llm
+        self.windows = WindowsAutomationService()
 
         base = Path(settings.data_dir)
         if not base.is_absolute():
@@ -253,7 +265,7 @@ class AutomationService:
         try:
             self._set_status(run, "planning")
             self._append_event(run, "planning", "Planning automation steps.")
-            if BLOCKED_PROMPT_PATTERN.search(run.prompt):
+            if BLOCKED_PROMPT_PATTERN.search(run.prompt) and not self._looks_like_destructive_windows_file_action(run.prompt):
                 raise ValueError("This automation request is blocked by the safety policy.")
 
             plan = recipe.steps if recipe and recipe.steps else await self._plan_steps(run.prompt)
@@ -309,6 +321,8 @@ class AutomationService:
 
     def _should_use_stable_plan(self, prompt: str) -> bool:
         normalized = prompt.lower()
+        if self._looks_like_windows_prompt(prompt):
+            return True
         if "youtube" in normalized or "you tube" in normalized or "yt " in normalized:
             return True
         if "gmail" in normalized or "mail.google" in normalized:
@@ -332,6 +346,13 @@ class AutomationService:
         normalized = prompt.lower()
         steps: list[dict[str, Any]] = []
         create_recipe = "new automation" in normalized or "reusable automation" in normalized or "save" in normalized
+
+        windows_steps = self._windows_heuristic_plan(prompt)
+        if windows_steps:
+            steps.extend(windows_steps)
+            if create_recipe:
+                steps.append({"tool": "automation.save_recipe", "description": "Save this workflow for reuse.", "args": {}})
+            return steps
 
         if url := self._extract_url(prompt):
             steps.append({"tool": "browser.open", "description": f"Open {url}.", "args": {"url": url}})
@@ -369,6 +390,142 @@ class AutomationService:
             steps.append({"tool": "automation.save_recipe", "description": "Save this workflow for reuse.", "args": {}})
         return steps
 
+    def _windows_heuristic_plan(self, prompt: str) -> list[dict[str, Any]]:
+        normalized = self._normalize_prompt(prompt)
+        if self._looks_like_destructive_windows_file_action(prompt):
+            return [
+                {
+                    "tool": "windows.reject_destructive_file_action",
+                    "description": "Reject destructive file automation.",
+                    "args": {"reason": "Astra does not delete, move, rename, format, or wipe files in automation mode."},
+                }
+            ]
+
+        if self._looks_like_alarm_intent(normalized):
+            try:
+                alarm_args = self._parse_alarm_args(prompt)
+            except ValueError as exc:
+                alarm_args = {"error": str(exc)}
+            return [{"tool": "windows.set_alarm", "description": "Set a Windows alarm.", "args": alarm_args}]
+
+        if self._looks_like_calculator_intent(normalized):
+            expression = self._extract_calculator_expression(prompt)
+            description = "Open Calculator."
+            if expression:
+                description = f"Open Calculator and enter {expression}."
+            return [{"tool": "windows.open_calculator", "description": description, "args": {"expression": expression}}]
+
+        if self._looks_like_file_explorer_intent(normalized):
+            target = self._extract_file_explorer_target(prompt)
+            description = f"Open File Explorer{f' to {target}' if target else ''}."
+            return [{"tool": "windows.open_file_explorer", "description": description, "args": {"target": target}}]
+
+        return []
+
+    def _looks_like_windows_prompt(self, prompt: str) -> bool:
+        normalized = self._normalize_prompt(prompt)
+        return (
+            self._looks_like_destructive_windows_file_action(prompt)
+            or self._looks_like_alarm_intent(normalized)
+            or self._looks_like_calculator_intent(normalized)
+            or self._looks_like_file_explorer_intent(normalized)
+        )
+
+    def _looks_like_destructive_windows_file_action(self, prompt: str) -> bool:
+        return bool(WINDOWS_DESTRUCTIVE_FILE_PATTERN.search(prompt))
+
+    def _looks_like_alarm_intent(self, normalized: str) -> bool:
+        return bool(re.search(r"\b(alarm|alarms|clock)\b", normalized) and re.search(r"\b(open|set|create|add|start)\b", normalized))
+
+    def _looks_like_calculator_intent(self, normalized: str) -> bool:
+        return bool(re.search(r"\b(calculator|calc)\b", normalized) and re.search(r"\b(open|launch|start|calculate|compute|what is|what's)\b", normalized))
+
+    def _looks_like_file_explorer_intent(self, normalized: str) -> bool:
+        if re.search(r"\b(file explorer|explorer)\b", normalized) and re.search(r"\b(open|launch|start|show)\b", normalized):
+            return True
+        return bool(re.search(r"\b(open|launch|start|show)\b", normalized) and re.search(r"\b(downloads?|documents?|desktop|pictures|videos|music)\s+(folder|directory)\b", normalized))
+
+    def _parse_alarm_args(self, prompt: str) -> dict[str, Any]:
+        target_time = self._parse_alarm_time(prompt)
+        label = self._extract_alarm_label(prompt)
+        return {
+            "target_iso": target_time.isoformat(),
+            "display_time": target_time.strftime("%I:%M %p").lstrip("0"),
+            "label": label,
+        }
+
+    def _parse_alarm_time(self, prompt: str) -> datetime:
+        now = self._now()
+        normalized = self._normalize_prompt(prompt)
+        match = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", normalized)
+        if not match:
+            raise ValueError("Tell Astra the alarm time, for example 5:30 PM today.")
+
+        hour = int(match.group(1))
+        minute = int(match.group(2) or "0")
+        meridiem = match.group(3)
+        if minute > 59:
+            raise ValueError("Alarm minutes must be between 00 and 59.")
+        if meridiem:
+            if hour < 1 or hour > 12:
+                raise ValueError("Use a 1-12 hour value with AM or PM.")
+            if meridiem == "pm" and hour != 12:
+                hour += 12
+            if meridiem == "am" and hour == 12:
+                hour = 0
+        elif hour > 23:
+            raise ValueError("Use a valid hour for the alarm.")
+
+        target_date = now.date()
+        explicit_today = "today" in normalized
+        explicit_tomorrow = "tomorrow" in normalized
+        if explicit_tomorrow:
+            target_date = (now + timedelta(days=1)).date()
+
+        target_time = datetime.combine(target_date, datetime.min.time()).replace(hour=hour, minute=minute)
+        if target_time <= now:
+            if explicit_today:
+                raise ValueError("That alarm time has already passed today, so Astra did not set an alarm. Choose a future time such as tomorrow.")
+            target_time += timedelta(days=1)
+        return target_time
+
+    def _extract_alarm_label(self, prompt: str) -> str:
+        match = re.search(r"\b(?:called|named|label(?:ed)?)\s+(.+)$", prompt, re.IGNORECASE)
+        if not match:
+            return "Astra alarm"
+        label = re.sub(r"\s+", " ", match.group(1)).strip(" .")
+        return label[:80] or "Astra alarm"
+
+    def _extract_calculator_expression(self, prompt: str) -> str:
+        cleaned = re.sub(r"\b(open|launch|start|calculator|calc|calculate|compute|what is|what's|please|and|enter|type)\b", " ", prompt, flags=re.IGNORECASE)
+        cleaned = cleaned.replace("x", "*").replace("X", "*").replace("÷", "/").replace("×", "*")
+        expression = re.sub(r"\s+", "", cleaned)
+        if not expression or not CALCULATOR_EXPRESSION_PATTERN.fullmatch(expression):
+            return ""
+        return expression[:80]
+
+    def _extract_file_explorer_target(self, prompt: str) -> str:
+        normalized = self._normalize_prompt(prompt)
+        drive_match = re.search(r"\b([a-z]):\\?\b", prompt, re.IGNORECASE)
+        if drive_match:
+            return f"{drive_match.group(1).upper()}:\\"
+        drive_word_match = re.search(r"\b([a-z])\s+drive\b", normalized)
+        if drive_word_match:
+            return f"{drive_word_match.group(1).upper()}:\\"
+        for target in ("downloads", "documents", "desktop", "pictures", "videos", "music"):
+            if re.search(rf"\b{target}\b", normalized):
+                return target
+        path_match = re.search(r"([a-zA-Z]:\\[^\n\r]+)", prompt)
+        if path_match:
+            return path_match.group(1).strip().strip("\"'")
+        return ""
+
+    def _normalize_prompt(self, prompt: str) -> str:
+        return re.sub(r"\s+", " ", prompt.lower()).strip()
+
+    def _now(self) -> datetime:
+        return datetime.now()
+
     def _sanitize_steps(self, steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
         clean_steps: list[dict[str, Any]] = []
         for raw in steps:
@@ -399,6 +556,18 @@ class AutomationService:
                     continue
                 if url:
                     args["url"] = url
+            if tool == "windows.set_alarm":
+                args["target_iso"] = str(args.get("target_iso") or "").strip()
+                args["display_time"] = str(args.get("display_time") or "").strip()[:40]
+                args["label"] = str(args.get("label") or "Astra alarm").strip()[:80]
+                args["error"] = str(args.get("error") or "").strip()[:240]
+            if tool == "windows.open_calculator":
+                expression = str(args.get("expression") or "").strip().replace(" ", "")
+                args["expression"] = expression[:80] if expression and CALCULATOR_EXPRESSION_PATTERN.fullmatch(expression) else ""
+            if tool == "windows.open_file_explorer":
+                args["target"] = str(args.get("target") or "").strip()[:260]
+            if tool == "windows.reject_destructive_file_action":
+                args["reason"] = str(args.get("reason") or "Astra blocked this destructive file action.").strip()[:240]
             clean_steps.append({"tool": tool, "description": description, "args": args})
         return clean_steps
 
@@ -435,6 +604,69 @@ class AutomationService:
             await self._tool_python_run_safe(run, step["args"]["code"])
         elif tool == "video.download_permitted":
             await self._tool_video_download_permitted(run, step["args"])
+        elif tool == "windows.set_alarm":
+            await self._tool_windows_set_alarm(run, step["args"])
+        elif tool == "windows.open_calculator":
+            await self._tool_windows_open_calculator(run, step["args"])
+        elif tool == "windows.open_file_explorer":
+            await self._tool_windows_open_file_explorer(run, step["args"])
+        elif tool == "windows.reject_destructive_file_action":
+            await self._tool_windows_reject_destructive_file_action(run, step["args"])
+
+    async def _tool_windows_set_alarm(self, run: AutomationRun, args: dict[str, Any]) -> None:
+        if args.get("error"):
+            message = str(args["error"])
+            run.result = message
+            self._append_event(run, "blocked", message, {"app": "Windows Clock", "reason": "invalid_alarm_time"})
+            self._set_status(run, "cancelled")
+            return
+
+        target_iso = str(args.get("target_iso") or "").strip()
+        if not target_iso:
+            raise ValueError("Alarm automation needs a target time.")
+        try:
+            target_time = datetime.fromisoformat(target_iso)
+        except ValueError as exc:
+            raise ValueError("Alarm automation received an invalid target time.") from exc
+        if target_time <= self._now():
+            message = "That alarm time has already passed, so Astra did not set an alarm. Choose a future time."
+            run.result = message
+            self._append_event(run, "blocked", message, {"app": "Windows Clock", "reason": "past_alarm_time", "alarm_time": target_iso})
+            self._set_status(run, "cancelled")
+            return
+
+        label = str(args.get("label") or "Astra alarm").strip()[:80]
+        result = await asyncio.to_thread(self.windows.set_alarm, target_time, label)
+        self._append_windows_result(run, result)
+        if not result.ok:
+            raise ValueError(result.message)
+        run.result = result.message
+
+    async def _tool_windows_open_calculator(self, run: AutomationRun, args: dict[str, Any]) -> None:
+        expression = str(args.get("expression") or "").strip()
+        result = await asyncio.to_thread(self.windows.open_calculator, expression)
+        self._append_windows_result(run, result)
+        if not result.ok:
+            raise ValueError(result.message)
+        run.result = result.message
+
+    async def _tool_windows_open_file_explorer(self, run: AutomationRun, args: dict[str, Any]) -> None:
+        target = str(args.get("target") or "").strip()
+        result = await asyncio.to_thread(self.windows.open_file_explorer, target)
+        self._append_windows_result(run, result)
+        if not result.ok:
+            raise ValueError(result.message)
+        run.result = result.message
+
+    async def _tool_windows_reject_destructive_file_action(self, run: AutomationRun, args: dict[str, Any]) -> None:
+        message = str(args.get("reason") or "Astra blocked this destructive file automation.").strip()
+        run.result = message
+        self._append_event(run, "blocked", message, {"tool": "windows.reject_destructive_file_action"})
+        self._set_status(run, "cancelled")
+
+    def _append_windows_result(self, run: AutomationRun, result: WindowsAutomationResult) -> None:
+        data = {"ok": result.ok, **result.data}
+        self._append_event(run, result.event_type, result.message, data)
 
     async def _tool_browser_open(self, run: AutomationRun, url: str) -> None:
         last_error: Exception | None = None
@@ -1087,14 +1319,14 @@ class AutomationService:
         if "accounts.google.com" in host or "signin" in current.lower() or "login" in current.lower():
             await self._wait_for_user(run, "Log in in the Automation Browser, then press Continue.")
 
-    async def _wait_for_user(self, run: AutomationRun, reason: str) -> None:
+    async def _wait_for_user(self, run: AutomationRun, reason: str, status: str = "waiting_for_login", event_type: str | None = None) -> None:
         event = self._continue_events.get(run.id)
         if not event:
             event = asyncio.Event()
             self._continue_events[run.id] = event
         event.clear()
-        self._set_status(run, "waiting_for_login")
-        self._append_event(run, "waiting_for_login", reason)
+        self._set_status(run, status)
+        self._append_event(run, event_type or status, reason)
         self._save_run(run)
         await event.wait()
         self._set_status(run, "running")

@@ -1,5 +1,6 @@
 import asyncio
 import sys
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,6 +10,7 @@ from app.config import Settings
 from app.models import AutomationCancelRequest, AutomationConfirmRequest, AutomationRecipeCreateRequest, AutomationRun, AutomationRunRequest
 from app.services.automations import AutomationCancelledError, AutomationService, VIDEO_DOWNLOAD_FALLBACK_FORMAT_SELECTOR
 from app.services.llm import LlmService
+from app.services.windows_automation import WindowsAutomationResult
 
 
 def build_service(tmp_path):
@@ -97,6 +99,62 @@ def test_direct_youtube_download_plan_uses_video_url_without_search(tmp_path):
     assert [step["tool"] for step in steps] == ["browser.open", "video.download_permitted"]
     assert steps[0]["args"]["url"] == "https://www.youtube.com/watch?v=MhUS3zJ6WMs"
     assert steps[1]["args"]["url"] == "https://www.youtube.com/watch?v=MhUS3zJ6WMs"
+
+
+def test_alarm_plan_uses_windows_tool_not_google(tmp_path, monkeypatch):
+    service = build_service(tmp_path)
+    monkeypatch.setattr(service, "_now", lambda: datetime(2026, 5, 20, 10, 0))
+
+    steps = service._heuristic_plan("open alarm and set it for 5:30 PM today")
+
+    assert [step["tool"] for step in steps] == ["windows.set_alarm"]
+    assert steps[0]["args"]["target_iso"].startswith("2026-05-20T17:30")
+    assert "error" not in steps[0]["args"]
+
+
+def test_alarm_plan_rejects_past_today_time(tmp_path, monkeypatch):
+    service = build_service(tmp_path)
+    monkeypatch.setattr(service, "_now", lambda: datetime(2026, 5, 20, 18, 0))
+
+    steps = service._heuristic_plan("open alarm and set it for 5:30 PM today")
+
+    assert [step["tool"] for step in steps] == ["windows.set_alarm"]
+    assert "already passed" in steps[0]["args"]["error"]
+
+
+def test_calculator_plan_sanitizes_expression(tmp_path):
+    service = build_service(tmp_path)
+
+    steps = service._heuristic_plan("open calculator and calculate 45*6")
+
+    assert [step["tool"] for step in steps] == ["windows.open_calculator"]
+    assert steps[0]["args"]["expression"] == "45*6"
+
+
+def test_file_explorer_plan_resolves_downloads_folder(tmp_path):
+    service = build_service(tmp_path)
+
+    steps = service._heuristic_plan("open downloads folder")
+
+    assert [step["tool"] for step in steps] == ["windows.open_file_explorer"]
+    assert steps[0]["args"]["target"] == "downloads"
+
+
+def test_file_explorer_plan_resolves_drive_target(tmp_path):
+    service = build_service(tmp_path)
+
+    steps = service._heuristic_plan("open D drive in file explorer")
+
+    assert [step["tool"] for step in steps] == ["windows.open_file_explorer"]
+    assert steps[0]["args"]["target"] == "D:\\"
+
+
+def test_destructive_file_prompt_uses_blocked_windows_tool(tmp_path):
+    service = build_service(tmp_path)
+
+    steps = service._heuristic_plan("delete this file")
+
+    assert [step["tool"] for step in steps] == ["windows.reject_destructive_file_action"]
 
 
 def test_download_unavailable_message_includes_youtube_link(tmp_path):
@@ -343,6 +401,86 @@ async def test_blocked_prompt_finishes_with_error(tmp_path):
 
     assert "blocked" in finished.error.lower()
     assert finished.events[-1].type == "error"
+
+
+@pytest.mark.asyncio
+async def test_windows_calculator_tool_emits_calculator_event(tmp_path):
+    service = build_service(tmp_path)
+    run = AutomationRun(id="calculator-test", prompt="open calculator")
+
+    class FakeWindows:
+        def open_calculator(self, expression):
+            return WindowsAutomationResult(True, "calculator", f"Opened Calculator and typed {expression}.", {"expression": expression})
+
+    service.windows = FakeWindows()  # type: ignore[assignment]
+
+    await service._tool_windows_open_calculator(run, {"expression": "45*6"})
+
+    assert run.result == "Opened Calculator and typed 45*6."
+    assert run.events[-1].type == "calculator"
+    assert run.events[-1].data["expression"] == "45*6"
+
+
+@pytest.mark.asyncio
+async def test_windows_file_explorer_tool_emits_file_explorer_event(tmp_path):
+    service = build_service(tmp_path)
+    run = AutomationRun(id="explorer-test", prompt="open downloads folder")
+
+    class FakeWindows:
+        def open_file_explorer(self, target):
+            return WindowsAutomationResult(True, "file_explorer", "Opened downloads.", {"target": target, "opened_path": "C:\\Users\\Astra\\Downloads"})
+
+    service.windows = FakeWindows()  # type: ignore[assignment]
+
+    await service._tool_windows_open_file_explorer(run, {"target": "downloads"})
+
+    assert run.result == "Opened downloads."
+    assert run.events[-1].type == "file_explorer"
+    assert "folder_path" not in run.events[-1].data
+
+
+@pytest.mark.asyncio
+async def test_windows_alarm_tool_emits_alarm_set_event(tmp_path, monkeypatch):
+    service = build_service(tmp_path)
+    monkeypatch.setattr(service, "_now", lambda: datetime(2026, 5, 20, 10, 0))
+    run = AutomationRun(id="alarm-test", prompt="set alarm")
+
+    class FakeWindows:
+        def set_alarm(self, target_time, label):
+            return WindowsAutomationResult(True, "alarm_set", "Set alarm for 5:30 PM.", {"alarm_time": target_time.isoformat(), "label": label})
+
+    service.windows = FakeWindows()  # type: ignore[assignment]
+
+    await service._tool_windows_set_alarm(run, {"target_iso": "2026-05-20T17:30:00", "label": "Astra alarm"})
+
+    assert run.result == "Set alarm for 5:30 PM."
+    assert run.events[-1].type == "alarm_set"
+
+
+@pytest.mark.asyncio
+async def test_past_alarm_tool_blocks_without_error_status(tmp_path):
+    service = build_service(tmp_path)
+    run = AutomationRun(id="past-alarm-test", prompt="set past alarm")
+
+    await service._tool_windows_set_alarm(
+        run,
+        {"error": "That alarm time has already passed today, so Astra did not set an alarm. Choose a future time such as tomorrow."},
+    )
+
+    assert run.status == "cancelled"
+    assert run.events[-1].type == "blocked"
+    assert "did not set an alarm" in run.result
+
+
+@pytest.mark.asyncio
+async def test_destructive_file_run_is_cancelled_with_blocked_event(tmp_path):
+    service = build_service(tmp_path)
+
+    run = await service.start_run(AutomationRunRequest(prompt="move this file"))
+    finished = await wait_for_run(service, run.id, {"cancelled"})
+
+    assert any(event.type == "blocked" for event in finished.events)
+    assert "does not delete" in finished.result
 
 
 @pytest.mark.asyncio

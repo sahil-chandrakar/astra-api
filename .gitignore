@@ -24,3 +24,6 @@ tmp-*/
 # Logs
 *.log
 *.err.log
+
+# Local validation screenshots
+/*.png
