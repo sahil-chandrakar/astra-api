@@ -21,6 +21,8 @@ MockTestSourceRequirement = Literal["none", "pyq_required", "source_backed"]
 MockTestSourceMode = Literal["web", "uploaded_docs", "mixed"]
 MockTestGenerationMode = Literal["topic_practice", "profile_based", "syllabus_based", "source_backed_pyq", "pyq_style", "llm_planned"]
 MockAttemptStatus = Literal["active", "submitted"]
+LlmProvider = Literal["cerebras", "nvidia"]
+LlmProfileName = Literal["fast", "pro"]
 
 
 class ChatRequest(BaseModel):
@@ -54,6 +56,28 @@ class ChatResponse(BaseModel):
     answer: str
     events: list[AgentEvent] = Field(default_factory=list)
     setup_required: list[str] = Field(default_factory=list)
+
+
+class LlmProfileConfig(BaseModel):
+    provider: LlmProvider
+    model: str = Field(..., min_length=1)
+
+
+class LlmProviderStatus(BaseModel):
+    id: LlmProvider
+    label: str
+    configured: bool
+    models: list[str] = Field(default_factory=list)
+    base_url: str = ""
+
+
+class LlmSettingsResponse(BaseModel):
+    profiles: dict[LlmProfileName, LlmProfileConfig]
+    providers: list[LlmProviderStatus]
+
+
+class LlmSettingsUpdateRequest(BaseModel):
+    profiles: dict[LlmProfileName, LlmProfileConfig]
 
 
 class ResearchRequest(BaseModel):

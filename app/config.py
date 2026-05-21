@@ -15,6 +15,9 @@ class Settings(BaseSettings):
     cerebras_model: str = "zai-glm-4.7"
     cerebras_fast_model: str = "llama3.1-8b"
     cerebras_pro_model: str = ""
+    nvidia_api_key: str = ""
+    nvidia_base_url: str = "https://integrate.api.nvidia.com/v1"
+    nvidia_model: str = "moonshotai/kimi-k2.6"
     voice_provider: str = "piper"
     piper_voice_id: str = "en_US-lessac-high"
     piper_cache_dir: str = ".cache/piper"
@@ -40,6 +43,10 @@ class Settings(BaseSettings):
     @property
     def has_tavily(self) -> bool:
         return bool(self.tavily_api_key.strip())
+
+    @property
+    def has_nvidia(self) -> bool:
+        return bool(self.nvidia_api_key.strip())
 
     @property
     def wants_piper(self) -> bool:

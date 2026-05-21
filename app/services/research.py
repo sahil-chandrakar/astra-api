@@ -314,6 +314,10 @@ class ResearchService:
         job.status = status  # type: ignore[assignment]
         job.updated_at = datetime.utcnow()
 
+    def _pro_model(self) -> str:
+        model_selector = getattr(self.llm, "model_for_profile", None)
+        return model_selector("pro") if callable(model_selector) else self.settings.resolved_cerebras_pro_model
+
     def _emit(self, job: ResearchJobResponse, agent: str, status: str, message: str, sources: list[Source] | None = None) -> None:
         job.events.append(AgentEvent(agent=agent, status=status, message=message, sources=sources or []))  # type: ignore[arg-type]
         job.updated_at = datetime.utcnow()
@@ -453,7 +457,7 @@ class ResearchService:
             "Every item must use only the provided source text."
         )
         user_prompt = f"Topic: {request.topic}\nExtract 8-18 strong evidence cards from these sources:\n\n{evidence_input}"
-        raw, setup = await self.llm.complete(system_prompt, user_prompt, model=self.settings.resolved_cerebras_pro_model)
+        raw, setup = await self.llm.complete(system_prompt, user_prompt, model=self._pro_model())
         parsed = self._parse_evidence(raw, len(documents))
         return (parsed or local)[:24], setup
 
@@ -505,7 +509,7 @@ class ResearchService:
             "Use cautious wording such as 'the source says' for blog/editorial sources; reserve 'data shows' "
             "for statistical, official, or primary research sources."
         )
-        raw, setup = await self.llm.complete(system_prompt, user_prompt, model=self.settings.resolved_cerebras_pro_model)
+        raw, setup = await self.llm.complete(system_prompt, user_prompt, model=self._pro_model())
         if self._report_is_usable(raw, documents):
             repaired = self._post_process_report(raw, request, documents, evidence, critic_notes)
             if not self.validator.validate(repaired, len(documents)):

@@ -34,7 +34,11 @@ class AstraAgentSystem:
             AgentEvent(agent="Command Router", status="complete", message=f"Routing {mode} request."),
             AgentEvent(agent="Writer Agent", status="working", message="Preparing Astra response."),
         ]
-        model = self.settings.resolved_cerebras_pro_model if astra_pro or mode == "agents" else self.settings.resolved_cerebras_fast_model
+        profile = "pro" if astra_pro or mode == "agents" else "fast"
+        model_selector = getattr(self.llm, "model_for_profile", None)
+        model = model_selector(profile) if callable(model_selector) else (
+            self.settings.resolved_cerebras_pro_model if profile == "pro" else self.settings.resolved_cerebras_fast_model
+        )
         system_prompt = (
             "You are Astra, a fast voice-first college AI agent. "
             "In cockpit chat, answer in 2-4 practical sentences unless the user asks for depth."

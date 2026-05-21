@@ -1,10 +1,11 @@
 import pytest
 
 from app.config import Settings
-from app.models import ChatResponse, CommandRequest, ResearchRequest
+from app.models import ChatResponse, CommandRequest, LlmProfileConfig, LlmSettingsUpdateRequest, ResearchRequest
 from app.services.agents import AstraAgentSystem
 from app.services.commands import CommandService
 from app.services.desktop import DesktopActionService
+from app.services.llm import LlmService
 
 
 class RecordingLlm:
@@ -47,6 +48,30 @@ def build_command_service(tmp_path):
     agent_system.llm = recorder  # type: ignore[assignment]
     service = CommandService(agent_system, DesktopActionService(), object(), EmptySafeAgent())  # type: ignore[arg-type]
     return service, agent_system, recorder
+
+
+def test_llm_settings_restrict_cerebras_models_by_profile(tmp_path):
+    settings = Settings(
+        data_dir=str(tmp_path / "data"),
+        reports_dir=str(tmp_path / "reports"),
+        piper_cache_dir=str(tmp_path / "piper"),
+        cerebras_fast_model="llama3.1-8b",
+        cerebras_model="zai-glm-4.7",
+        cerebras_pro_model="",
+    )
+    llm = LlmService(settings)
+
+    response = llm.update_settings(
+        LlmSettingsUpdateRequest(
+            profiles={
+                "fast": LlmProfileConfig(provider="cerebras", model="gpt-oss-120b"),
+                "pro": LlmProfileConfig(provider="cerebras", model="llama3.1-8b"),
+            }
+        )
+    )
+
+    assert response.profiles["fast"].model == "llama3.1-8b"
+    assert response.profiles["pro"].model == "zai-glm-4.7"
 
 
 @pytest.mark.asyncio

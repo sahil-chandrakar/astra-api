@@ -19,6 +19,7 @@ from app.models import (
     ChatRequest,
     CommandRequest,
     DocumentQuestionRequest,
+    LlmSettingsUpdateRequest,
     MockTestGenerateRequest,
     MockTestSubmitRequest,
     ResearchRequest,
@@ -80,13 +81,19 @@ async def warm_voice() -> None:
 
 @app.get("/health")
 async def health() -> dict[str, object]:
+    llm_profiles = agent_system.llm.current_profiles()
     return {
         "status": "ok",
         "app": "Astra AI Agent API",
-        "model": settings.resolved_cerebras_pro_model,
-        "models": settings.cerebras_models,
+        "model": agent_system.llm.model_for_profile("pro"),
+        "models": {
+            "fast": agent_system.llm.model_for_profile("fast"),
+            "pro": agent_system.llm.model_for_profile("pro"),
+        },
+        "llm_profiles": {name: profile.model_dump(mode="json") for name, profile in llm_profiles.items()},
         "providers": {
             "cerebras": settings.has_cerebras,
+            "nvidia": settings.has_nvidia,
             "tavily": settings.has_tavily,
             "openalex": True,
             "semantic_scholar": True,
@@ -94,6 +101,16 @@ async def health() -> dict[str, object]:
             "piper_local": voice_service.status().enabled,
         },
     }
+
+
+@app.get("/api/llm/settings")
+async def llm_settings():
+    return agent_system.llm.settings_response()
+
+
+@app.put("/api/llm/settings")
+async def update_llm_settings(request: LlmSettingsUpdateRequest):
+    return agent_system.llm.update_settings(request)
 
 
 @app.get("/api/agents")

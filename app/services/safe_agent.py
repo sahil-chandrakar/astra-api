@@ -1852,8 +1852,10 @@ class SafeAgentService:
         return None
 
     def _provider_status(self) -> dict[str, bool]:
+        nvidia_configured = getattr(self.llm, "provider_configured", lambda provider: False)("nvidia")
         return {
             "cerebras": self.settings.has_cerebras,
+            "nvidia": nvidia_configured,
             "tavily": self.settings.has_tavily,
             "openalex": True,
             "semantic_scholar": True,

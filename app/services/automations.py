@@ -337,7 +337,9 @@ class AutomationService:
             "Never output tools outside the enum."
         )
         user_prompt = f"User automation request: {prompt}"
-        raw, _setup = await self.llm.complete(system_prompt, user_prompt, model=self.settings.resolved_cerebras_pro_model)
+        model_selector = getattr(self.llm, "model_for_profile", None)
+        model = model_selector("pro") if callable(model_selector) else self.settings.resolved_cerebras_pro_model
+        raw, _setup = await self.llm.complete(system_prompt, user_prompt, model=model)
         payload = self._extract_json(raw)
         steps = payload.get("steps") if isinstance(payload, dict) else None
         return steps if isinstance(steps, list) else []
