@@ -40,12 +40,14 @@ from app.services.mock_tests import MOCK_TEST_GENERATION_TIMEOUT_SECONDS, MockTe
 from app.services.reports import ReportService
 from app.services.research import ResearchService
 from app.services.safe_agent import SafeAgentService
+from app.services.speech_to_text import SpeechToTextService
 from app.services.study import StudyService
 from app.services.voice import VoiceService
 
 settings = get_settings()
 agent_system = AstraAgentSystem(settings)
 voice_service = VoiceService(settings)
+speech_to_text_service = SpeechToTextService(settings)
 report_service = ReportService(settings)
 research_service = ResearchService(settings, agent_system.llm, agent_system.search, report_service)
 agent_system.research_service = research_service
@@ -377,15 +379,10 @@ async def download_report(report_id: str):
 
 @app.post("/api/voice/transcribe")
 async def transcribe(audio: UploadFile | None = File(default=None)):
-    filename = audio.filename if audio else "no file"
-    return VoiceTranscriptionResponse(
-        transcript="",
-        message=(
-            f"Received {filename}. Browser speech recognition is used for v1 hands-free voice; "
-            "backend Whisper transcription can be plugged in later."
-        ),
-        setup_required=[],
-    )
+    if not audio:
+        return VoiceTranscriptionResponse(transcript="", message="No audio was received.", setup_required=[])
+    content = await audio.read()
+    return await speech_to_text_service.transcribe_upload(audio.filename or "voice.webm", content)
 
 
 @app.get("/api/voice/status")

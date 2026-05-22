@@ -244,8 +244,198 @@ async def test_planner_falls_back_when_llm_returns_empty_content(tmp_path):
 
     steps = await service._plan_steps("open youtube and search for codewithharry")
 
-    assert steps[0]["tool"] == "browser.search"
-    assert steps[0]["args"]["site"] == "youtube"
+    assert steps[0]["tool"] == "youtube.search"
+    assert steps[0]["args"]["query"] == "codewithharry"
+
+
+@pytest.mark.asyncio
+async def test_youtube_latest_name_prompt_uses_structured_youtube_tools(tmp_path):
+    service = build_service(tmp_path)
+
+    steps = await service._plan_steps("open youtube and search for wwe latest video and just name the video and nothing else")
+
+    assert [step["tool"] for step in steps] == ["youtube.search", "youtube.result"]
+    assert steps[0]["args"]["query"] == "wwe"
+    assert steps[0]["args"]["action"] == "name"
+    assert steps[0]["args"]["result_type"] == "video"
+    assert steps[0]["args"]["upload_date"] == "recent"
+    assert steps[0]["args"]["sort"] == "upload_date"
+    assert steps[0]["args"]["route"] == "auto"
+    assert steps[1]["args"]["mode"] == "name"
+
+
+@pytest.mark.asyncio
+async def test_youtube_play_and_filter_prompt_uses_play_result(tmp_path):
+    service = build_service(tmp_path)
+
+    steps = await service._plan_steps("play latest wwe live video on youtube")
+
+    assert [step["tool"] for step in steps] == ["youtube.search", "youtube.result"]
+    assert steps[0]["args"]["query"] == "wwe"
+    assert steps[0]["args"]["action"] == "play"
+    assert steps[0]["args"]["result_type"] == "live"
+    assert steps[0]["args"]["upload_date"] == "recent"
+    assert steps[0]["args"]["route"] == "auto"
+    assert steps[1]["args"]["mode"] == "play"
+
+
+@pytest.mark.asyncio
+async def test_youtube_explicit_channel_prompt_uses_channel_route(tmp_path):
+    service = build_service(tmp_path)
+
+    steps = await service._plan_steps("open youtube and search for codewithharry channel newest video and just name the video")
+
+    assert [step["tool"] for step in steps] == ["youtube.search", "youtube.result"]
+    assert steps[0]["args"]["query"] == "codewithharry"
+    assert steps[0]["args"]["route"] == "channel"
+    assert steps[0]["args"]["channel_hint"] is True
+    assert steps[0]["args"]["result_type"] == "video"
+    assert steps[0]["args"]["sort"] == "upload_date"
+    assert steps[1]["args"]["mode"] == "name"
+
+
+@pytest.mark.asyncio
+async def test_youtube_topic_prompt_uses_topic_route(tmp_path):
+    service = build_service(tmp_path)
+
+    steps = await service._plan_steps("open youtube and search for python programming latest video and just name the video")
+
+    assert [step["tool"] for step in steps] == ["youtube.search", "youtube.result"]
+    assert steps[0]["args"]["query"] == "python programming"
+    assert steps[0]["args"]["route"] == "topic"
+    assert steps[0]["args"]["channel_hint"] is False
+    assert steps[0]["args"]["sort"] == "upload_date"
+
+
+@pytest.mark.asyncio
+async def test_youtube_popular_channel_prompt_uses_view_count_sort(tmp_path):
+    service = build_service(tmp_path)
+
+    steps = await service._plan_steps("popular video from Veritasium channel on youtube just name the title")
+
+    assert [step["tool"] for step in steps] == ["youtube.search", "youtube.result"]
+    assert steps[0]["args"]["query"] == "Veritasium"
+    assert steps[0]["args"]["route"] == "channel"
+    assert steps[0]["args"]["sort"] == "view_count"
+    assert steps[1]["args"]["mode"] == "name"
+
+
+@pytest.mark.asyncio
+async def test_youtube_source_qualified_content_prompt_uses_target_search(tmp_path):
+    service = build_service(tmp_path)
+
+    steps = await service._plan_steps("open youtube and play song from t series : asma ko chu kar dekha song")
+
+    assert [step["tool"] for step in steps] == ["youtube.search", "youtube.result"]
+    assert steps[0]["args"]["query"] == "asma ko chu kar dekha song t series"
+    assert steps[0]["args"]["channel_query"] == "t series"
+    assert steps[0]["args"]["content_query"] == "asma ko chu kar dekha song"
+    assert steps[0]["args"]["source_qualified"] is True
+    assert steps[0]["args"]["route"] == "topic"
+    assert steps[0]["args"]["action"] == "play"
+    assert steps[1]["args"]["mode"] == "play"
+
+
+@pytest.mark.asyncio
+async def test_youtube_source_qualified_content_prompt_is_general(tmp_path):
+    service = build_service(tmp_path)
+
+    steps = await service._plan_steps("open youtube and play the rust ownership lecture from freecodecamp: borrow checker explained")
+
+    assert [step["tool"] for step in steps] == ["youtube.search", "youtube.result"]
+    assert steps[0]["args"]["query"] == "borrow checker explained freecodecamp"
+    assert steps[0]["args"]["channel_query"] == "freecodecamp"
+    assert steps[0]["args"]["content_query"] == "borrow checker explained"
+    assert steps[0]["args"]["source_qualified"] is True
+    assert steps[0]["args"]["route"] == "topic"
+    assert steps[0]["args"]["action"] == "play"
+
+
+@pytest.mark.asyncio
+async def test_youtube_source_qualified_play_from_prompt_without_media_word(tmp_path):
+    service = build_service(tmp_path)
+
+    steps = await service._plan_steps("open youtube and play python decorators tutorial from freecodecamp")
+
+    assert [step["tool"] for step in steps] == ["youtube.search", "youtube.result"]
+    assert steps[0]["args"]["query"] == "python decorators tutorial freecodecamp"
+    assert steps[0]["args"]["channel_query"] == "freecodecamp"
+    assert steps[0]["args"]["content_query"] == "python decorators tutorial"
+    assert steps[0]["args"]["source_qualified"] is True
+    assert steps[0]["args"]["route"] == "topic"
+    assert steps[0]["args"]["action"] == "play"
+
+
+@pytest.mark.asyncio
+async def test_youtube_source_qualified_about_prompt(tmp_path):
+    service = build_service(tmp_path)
+
+    steps = await service._plan_steps("open youtube and search for latest video by NASA about mars rover and just name the video")
+
+    assert [step["tool"] for step in steps] == ["youtube.search", "youtube.result"]
+    assert steps[0]["args"]["query"] == "mars rover NASA"
+    assert steps[0]["args"]["channel_query"] == "NASA"
+    assert steps[0]["args"]["content_query"] == "mars rover"
+    assert steps[0]["args"]["source_qualified"] is True
+    assert steps[0]["args"]["route"] == "topic"
+    assert steps[0]["args"]["action"] == "name"
+
+
+@pytest.mark.asyncio
+async def test_youtube_channel_url_prompt_uses_channel_handle(tmp_path):
+    service = build_service(tmp_path)
+
+    steps = await service._plan_steps("open youtube and search for youtube.com/@veritasium latest video and just name the video")
+
+    assert [step["tool"] for step in steps] == ["youtube.search", "youtube.result"]
+    assert steps[0]["args"]["query"] == "veritasium"
+    assert steps[0]["args"]["route"] == "channel"
+    assert steps[0]["args"]["channel_hint"] is True
+    assert steps[0]["args"]["action"] == "name"
+
+
+def test_youtube_channel_scoring_handles_spaced_compound_names(tmp_path):
+    service = build_service(tmp_path)
+
+    score = service._score_youtube_channel_candidate(
+        "mr beast",
+        {"title": "MrBeast", "handle": "@MrBeast", "url": "https://www.youtube.com/@MrBeast"},
+    )
+
+    assert score == 1.0
+
+
+def test_youtube_title_filter_rejects_live_badges_and_durations(tmp_path):
+    service = build_service(tmp_path)
+
+    assert service._bad_youtube_title("LIVE") is True
+    assert service._bad_youtube_title("7:33:01") is True
+
+
+def test_source_qualified_youtube_results_prefer_matching_source(tmp_path):
+    service = build_service(tmp_path)
+
+    ranked = service._rank_youtube_source_results(
+        {"channel_query": "freecodecamp", "content_query": "borrow checker explained", "source_qualified": True},
+        [
+            {
+                "title": "Borrow Checker Explained Clearly",
+                "channel": "Random Tutorials",
+                "metadata": "",
+                "url": "https://www.youtube.com/watch?v=wrong",
+                "type": "video",
+            },
+            {
+                "title": "Rust Ownership and Borrow Checker Explained",
+                "channel": "freeCodeCamp.org",
+                "metadata": "",
+                "url": "https://www.youtube.com/watch?v=right",
+                "type": "video",
+            },
+        ],
+    )
+
+    assert ranked[0]["url"] == "https://www.youtube.com/watch?v=right"
 
 
 @pytest.mark.asyncio
@@ -279,8 +469,9 @@ def test_youtube_download_plan_opens_result_before_official_download(tmp_path):
 
     steps = service._heuristic_plan("open youtube and search for codewithharry and download it's first latest video")
 
-    assert [step["tool"] for step in steps] == ["browser.search", "browser.click", "video.download_permitted"]
-    assert steps[0]["args"]["query"] == "codewithharry latest"
+    assert [step["tool"] for step in steps] == ["youtube.search", "browser.click", "video.download_permitted"]
+    assert steps[0]["args"]["query"] == "codewithharry"
+    assert steps[0]["args"]["upload_date"] == "recent"
 
 
 def test_direct_youtube_download_plan_uses_video_url_without_search(tmp_path):

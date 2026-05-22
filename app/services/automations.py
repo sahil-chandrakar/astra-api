@@ -46,6 +46,8 @@ ALLOWED_AUTOMATION_TOOLS = {
     "browser.extract",
     "browser.wait_for_user",
     "browser.download",
+    "youtube.search",
+    "youtube.result",
     "artifact.resolve_reference",
     "artifact.list_recent",
     "artifact.pick",
@@ -856,18 +858,26 @@ class AutomationService:
             steps.append({"tool": "browser.open", "description": "Open Gmail.", "args": {"url": "https://mail.google.com/"}})
             steps.append({"tool": "browser.extract", "description": "Read visible Gmail information.", "args": {"target": "first 5 emails"}})
         elif "youtube" in normalized or "you tube" in normalized or "yt " in normalized:
-            query = self._extract_search_query(prompt, ("youtube", "you tube", "yt", "open", "download", "play", "search", "video"))
-            if query:
-                steps.append({"tool": "browser.search", "description": "Search YouTube.", "args": {"site": "youtube", "query": query}})
+            youtube_intent = self._parse_youtube_intent(prompt)
+            if youtube_intent["query"]:
+                steps.append(
+                    {
+                        "tool": "youtube.search",
+                        "description": "Search YouTube with matching filters.",
+                        "args": youtube_intent,
+                    }
+                )
             else:
                 steps.append({"tool": "browser.open", "description": "Open YouTube.", "args": {"url": "https://www.youtube.com/"}})
             if "download" in normalized:
                 steps.append({"tool": "browser.click", "description": "Open the first visible YouTube result.", "args": {"selector": "ytd-video-renderer a#thumbnail"}})
                 steps.append({"tool": "video.download_permitted", "description": "Download the opened public video.", "args": {}})
-            elif "play" in normalized:
-                steps.append({"tool": "browser.click", "description": "Open the first visible result.", "args": {"selector": "ytd-video-renderer a#thumbnail"}})
-            else:
-                steps.append({"tool": "browser.extract", "description": "Extract visible video results.", "args": {"target": "search results"}})
+            elif youtube_intent["action"] == "play":
+                steps.append({"tool": "youtube.result", "description": "Open the selected YouTube result.", "args": {"mode": "play", "index": 1}})
+            elif youtube_intent["action"] == "name":
+                steps.append({"tool": "youtube.result", "description": "Return the selected YouTube video title.", "args": {"mode": "name", "index": 1}})
+            elif youtube_intent["query"]:
+                steps.append({"tool": "youtube.result", "description": "Extract structured YouTube results.", "args": {"mode": "list", "index": 1}})
         elif "python" in normalized:
             steps.append({"tool": "python.run_safe", "description": "Run a constrained Python task.", "args": {"code": "print('Describe the Python automation steps more specifically.')"}})
         else:
@@ -933,6 +943,217 @@ class AutomationService:
         if re.search(r"\b(file explorer|explorer)\b", normalized) and re.search(r"\b(open|launch|start|show)\b", normalized):
             return True
         return bool(re.search(r"\b(open|launch|start|show)\b", normalized) and re.search(r"\b(downloads?|documents?|desktop|pictures|videos|music)\s+(folder|directory)\b", normalized))
+
+    def _parse_youtube_intent(self, prompt: str) -> dict[str, Any]:
+        normalized = self._normalize_prompt(prompt)
+        action = "results"
+        if re.search(r"\b(play|watch|open\s+(?:the\s+)?(?:first|top|latest)|start)\b", normalized):
+            action = "play"
+        if re.search(r"\b(name|title|just\s+name|nothing\s+else|only\s+(?:the\s+)?(?:name|title))\b", normalized):
+            action = "name"
+
+        result_type = "video"
+        if re.search(r"\bshorts?\b", normalized):
+            result_type = "shorts"
+        elif re.search(r"\blive\b", normalized):
+            result_type = "live"
+        elif re.search(r"\bchannels?\b", normalized) and not re.search(r"\bvideo|videos|latest|newest|recent|popular|play|watch|name|title\b", normalized):
+            result_type = "channel"
+        elif re.search(r"\bplaylists?\b", normalized):
+            result_type = "playlist"
+        elif not re.search(r"\bvideo|videos|latest|newest|recent|play|watch|name|title\b", normalized):
+            result_type = "all"
+
+        upload_date = ""
+        if re.search(r"\blast\s+hour\b|\bpast\s+hour\b", normalized):
+            upload_date = "hour"
+        elif re.search(r"\btoday\b|\blast\s+24\s+hours?\b", normalized):
+            upload_date = "today"
+        elif re.search(r"\bthis\s+week\b|\bweek\b", normalized):
+            upload_date = "week"
+        elif re.search(r"\bthis\s+month\b|\bmonth\b", normalized):
+            upload_date = "month"
+        elif re.search(r"\bthis\s+year\b|\byear\b", normalized):
+            upload_date = "year"
+        elif re.search(r"\blatest|newest|recent|recently\s+uploaded\b", normalized):
+            upload_date = "recent"
+
+        duration = ""
+        if re.search(r"\bshort\b|\bunder\s+4\s+minutes?\b", normalized):
+            duration = "short"
+        elif re.search(r"\blong\b|\bover\s+20\s+minutes?\b", normalized):
+            duration = "long"
+        elif re.search(r"\bmedium\b|\b4\s*-\s*20\s+minutes?\b", normalized):
+            duration = "medium"
+
+        sort = ""
+        if re.search(r"\bmost\s+viewed|popular|views?\b", normalized):
+            sort = "view_count"
+        elif re.search(r"\brating|top\s+rated\b", normalized):
+            sort = "rating"
+        elif upload_date in {"hour", "today", "week", "month", "year", "recent"}:
+            sort = "upload_date"
+
+        source = self._extract_youtube_source_and_content(prompt)
+        query = self._extract_youtube_query(prompt)
+        channel_hint = self._has_youtube_channel_hint(normalized)
+        topic_hint = self._has_youtube_topic_hint(normalized, query)
+        route = "auto"
+        if source.get("content_query"):
+            route = "topic"
+        elif channel_hint:
+            route = "channel"
+        elif topic_hint:
+            route = "topic"
+        return {
+            "query": query,
+            "action": action,
+            "result_type": result_type,
+            "upload_date": upload_date,
+            "duration": duration,
+            "sort": sort,
+            "features": [],
+            "route": route,
+            "channel_hint": channel_hint,
+            "channel_query": source.get("channel_query") or "",
+            "content_query": source.get("content_query") or "",
+            "source_qualified": bool(source.get("content_query")),
+        }
+
+    def _extract_youtube_query(self, prompt: str) -> str:
+        quoted = re.search(r"['\"]([^'\"]{1,240})['\"]", prompt)
+        if quoted:
+            return re.sub(r"\s+", " ", quoted.group(1)).strip()
+
+        channel_url_query = self._extract_youtube_channel_url_query(prompt)
+        if channel_url_query:
+            return channel_url_query
+
+        cleaned = re.sub(r"https?://[^\s]+", " ", prompt, flags=re.IGNORECASE)
+        source = self._extract_youtube_source_and_content(cleaned)
+        if source.get("content_query"):
+            return re.sub(r"\s+", " ", f"{source['content_query']} {source['channel_query']}").strip()[:240]
+        channel_query = self._extract_youtube_channel_query(cleaned)
+        if channel_query:
+            return channel_query
+        cleaned = cleaned.replace("it's", " ").replace("itâ€™s", " ")
+        phrases = (
+            "you tube",
+            "recently uploaded",
+            "last 24 hours",
+            "last hour",
+            "past hour",
+            "this week",
+            "this month",
+            "this year",
+            "just name",
+            "nothing else",
+            "only the name",
+            "only name",
+            "only the title",
+            "sort by",
+            "filter by",
+            "upload date",
+            "view count",
+        )
+        for phrase in phrases:
+            cleaned = re.sub(rf"\b{re.escape(phrase)}\b", " ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(
+            r"\b(youtube|yt|open|go|to|search|find|look|up|for|play|watch|start|download|latest|newest|recent|today|week|month|year|"
+            r"video|videos|short|shorts|live|channel|channels|playlist|playlists|filter|filters|name|title|the|a|an|and|or|on|in|"
+            r"first|top|result|results|please|only|with|under|over|minutes?|uploaded|by|rating|popular|view|views|count|else|about|stream|streams)\b",
+            " ",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        query = re.sub(r"[^a-zA-Z0-9 .'_+-]+", " ", cleaned)
+        query = re.sub(r"\s+", " ", query).strip(" .")
+        return query[:240]
+
+    def _extract_youtube_source_and_content(self, prompt: str) -> dict[str, str]:
+        cleaned = re.sub(r"https?://[^\s]+", " ", prompt, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        patterns = (
+            r"\b(?:from|by|uploaded\s+by|creator)\s+(.+?)\s*(?:[:;|]|\s+-\s+)\s*(.+)$",
+            r"\b(?:from|by|uploaded\s+by|creator)\s+(.+?)\s+(?:about|for|on)\s+(.+)$",
+            r"\b(?:from|by|uploaded\s+by|creator)\s+(.+?)\s+(?:song|track|music|video)\s+(?:called|named|titled)\s+(.+)$",
+            r"\bplay\s+(.+?)(?:\s+(?:song|track|music|video))?\s+(?:from|by)\s+(.+)$",
+        )
+        for index, pattern in enumerate(patterns):
+            match = re.search(pattern, cleaned, re.IGNORECASE)
+            if not match:
+                continue
+            if index == 3:
+                content_raw, channel_raw = match.group(1), match.group(2)
+            else:
+                channel_raw, content_raw = match.group(1), match.group(2)
+            channel = self._clean_youtube_query_fragment(channel_raw)
+            content = self._clean_youtube_query_fragment(content_raw)
+            if channel and content:
+                return {"channel_query": channel[:120], "content_query": content[:240]}
+        return {"channel_query": "", "content_query": ""}
+
+    def _extract_youtube_channel_query(self, prompt: str) -> str:
+        channel_url_query = self._extract_youtube_channel_url_query(prompt)
+        if channel_url_query:
+            return channel_url_query
+
+        channel_patterns = (
+            r"\b(?:from|by|uploaded\s+by|creator)\s+(.+?)(?:\s+(?:channel|on\s+youtube|youtube\s+channel))?(?:\s+(?:and|just|only|nothing|please|with|for|to|latest|newest|recent|popular|most\s+viewed|video|videos|short|shorts|live|stream|streams|play|watch|name|title)\b|$)",
+            r"\bsearch\s+(?:for\s+)?(.+?)\s+(?:youtube\s+)?channel\b",
+            r"\bopen\s+(?:the\s+)?(.+?)\s+(?:youtube\s+)?channel\b",
+            r"\b(.+?)\s+(?:youtube\s+)?channel\s+(?:latest|newest|recent|popular|most\s+viewed|video|videos|short|shorts|live|stream|streams|play|watch|name|title)\b",
+        )
+        for pattern in channel_patterns:
+            match = re.search(pattern, prompt, re.IGNORECASE)
+            if match:
+                candidate = self._clean_youtube_query_fragment(match.group(1))
+                if candidate:
+                    return candidate[:240]
+        return ""
+
+    def _extract_youtube_channel_url_query(self, prompt: str) -> str:
+        match = re.search(
+            r"(?:https?://)?(?:www\.)?youtube\.com/(?:(?:@|c/|user/)([^/\s?#]+)|channel/([^/\s?#]+))",
+            prompt,
+            re.IGNORECASE,
+        )
+        if not match:
+            return ""
+        value = match.group(1) or match.group(2) or ""
+        value = value.lstrip("@")
+        return self._clean_youtube_query_fragment(value)[:240]
+
+    def _clean_youtube_query_fragment(self, value: str) -> str:
+        cleaned = re.sub(r"https?://[^\s]+", " ", value, flags=re.IGNORECASE)
+        cleaned = cleaned.replace("it's", " ")
+        cleaned = re.sub(
+            r"\b(youtube|yt|open|go|to|search|find|look|up|for|play|watch|start|download|latest|newest|recent|today|week|month|year|"
+            r"video|videos|short|shorts|live|channel|channels|playlist|playlists|filter|filters|name|title|the|a|an|and|or|on|in|"
+            r"first|top|result|results|please|just|nothing|only|with|under|over|minutes?|uploaded|rating|popular|view|views|count|else|from|by)\b",
+            " ",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(r"[^a-zA-Z0-9 .'_+-]+", " ", cleaned)
+        return re.sub(r"\s+", " ", cleaned).strip(" .")
+
+    def _has_youtube_channel_hint(self, normalized_prompt: str) -> bool:
+        return bool(
+            re.search(r"\b(?:youtube\s+)?channel\b", normalized_prompt)
+            or re.search(r"(?:https?://)?(?:www\.)?youtube\.com/(?:@|channel/|c/|user/)[^\s]+", normalized_prompt)
+            or re.search(r"\b(?:from|by|uploaded\s+by|creator)\s+[\w@.'+-]", normalized_prompt)
+        )
+
+    def _has_youtube_topic_hint(self, normalized_prompt: str, query: str) -> bool:
+        haystack = f"{normalized_prompt} {query.lower()}"
+        return bool(
+            re.search(
+                r"\b(tutorial|how\s+to|learn|course|programming|coding|guide|explained|explanation|review|comparison|"
+                r"vs|versus|news\s+about|about|recipe|workout|lecture|class|lesson|documentary|highlights?|compilation)\b",
+                haystack,
+            )
+        )
 
     def _parse_alarm_args(self, prompt: str) -> dict[str, Any]:
         target_time = self._parse_alarm_time(prompt)
@@ -1105,6 +1326,38 @@ class AutomationService:
                 args["site"] = str(args.get("site") or "google").strip().lower()[:40]
                 if not args["query"]:
                     continue
+            if tool == "youtube.search":
+                args["query"] = str(args.get("query") or "").strip()[:240]
+                args["action"] = str(args.get("action") or "results").strip().lower()[:20]
+                args["result_type"] = str(args.get("result_type") or "video").strip().lower()[:20]
+                args["upload_date"] = str(args.get("upload_date") or "").strip().lower()[:20]
+                args["duration"] = str(args.get("duration") or "").strip().lower()[:20]
+                args["sort"] = str(args.get("sort") or "").strip().lower()[:20]
+                args["route"] = str(args.get("route") or "auto").strip().lower()[:20]
+                args["channel_hint"] = bool(args.get("channel_hint"))
+                args["channel_query"] = str(args.get("channel_query") or "").strip()[:120]
+                args["content_query"] = str(args.get("content_query") or "").strip()[:240]
+                args["source_qualified"] = bool(args.get("source_qualified"))
+                args["features"] = self._sanitize_string_list(args.get("features"), limit=8)
+                for key, allowed, default in (
+                    ("action", {"results", "name", "play"}, "results"),
+                    ("result_type", {"all", "video", "shorts", "live", "channel", "playlist"}, "video"),
+                    ("upload_date", {"", "hour", "today", "week", "month", "year", "recent"}, ""),
+                    ("duration", {"", "short", "medium", "long"}, ""),
+                    ("sort", {"", "relevance", "upload_date", "view_count", "rating"}, ""),
+                    ("route", {"auto", "channel", "topic"}, "auto"),
+                ):
+                    if args[key] not in allowed:
+                        args[key] = default
+                if not args["query"]:
+                    continue
+            if tool == "youtube.result":
+                mode = str(args.get("mode") or "list").strip().lower()
+                args["mode"] = mode if mode in {"list", "name", "play"} else "list"
+                try:
+                    args["index"] = min(10, max(1, int(args.get("index") or 1)))
+                except (TypeError, ValueError):
+                    args["index"] = 1
             if tool == "python.run_safe":
                 args["code"] = str(args.get("code") or "").strip()
                 if not args["code"] or PYTHON_BLOCKED_PATTERN.search(args["code"]):
@@ -1221,6 +1474,10 @@ class AutomationService:
             await self._wait_for_user(run, str(step["args"].get("reason") or step["description"]))
         elif tool == "browser.download":
             await self._tool_browser_download(run, step["args"])
+        elif tool == "youtube.search":
+            await self._tool_youtube_search(run, step["args"])
+        elif tool == "youtube.result":
+            await self._tool_youtube_result(run, step["args"])
         elif tool in {"artifact.resolve_reference", "file.search_scoped"}:
             await self._tool_artifact_resolve_reference(run, step["args"])
         elif tool == "artifact.list_recent":
@@ -1414,6 +1671,631 @@ class AutomationService:
         else:
             url = f"https://www.google.com/search?q={quote_plus(query)}"
         await self._tool_browser_open(run, url)
+
+    async def _tool_youtube_search(self, run: AutomationRun, args: dict[str, Any]) -> None:
+        query = str(args.get("query") or "").strip()
+        if not query:
+            raise ValueError("YouTube search needs a query.")
+
+        route = str(args.get("route") or "auto").strip().lower()
+        if route not in {"auto", "channel", "topic"}:
+            route = "auto"
+        context = self._runtime_context_for(run)
+        if route in {"auto", "channel"}:
+            channel_match = await self._search_youtube_channel_videos(run, args, explicit=route == "channel")
+            if channel_match:
+                channel, results = channel_match
+                filters = self._youtube_filter_context(args)
+                context["youtube_query"] = query
+                context["youtube_filters"] = filters
+                context["youtube_route"] = "channel"
+                context["youtube_channel"] = channel
+                context["youtube_results"] = results
+                self._sync_runtime_context_to_run(run)
+                summary = self._format_youtube_results(results)
+                run.result = summary
+                self._append_event(
+                    run,
+                    "youtube_channel_search",
+                    f"Opened {channel.get('title') or query} channel and found {len(results)} YouTube result{'s' if len(results) != 1 else ''}.",
+                    {
+                        "query": query,
+                        "filters": filters,
+                        "channel": channel,
+                        "results": results[:5],
+                        "url": run.current_url,
+                    },
+                )
+                return
+            if route == "channel":
+                raise ValueError(f"No matching YouTube channel videos were found for {query}.")
+
+        page = await self._ensure_page()
+        url = f"https://www.youtube.com/results?search_query={quote_plus(query)}"
+        await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        run.current_url = page.url
+        await self._wait_for_youtube_ready(page)
+        await self._apply_youtube_filters(page, args)
+        await self._wait_for_youtube_ready(page)
+        results = await self._extract_youtube_results(page, str(args.get("result_type") or "video"))
+        if bool(args.get("source_qualified")):
+            results = self._rank_youtube_source_results(args, results)
+
+        filters = self._youtube_filter_context(args)
+        context["youtube_query"] = query
+        context["youtube_filters"] = filters
+        context["youtube_route"] = "topic"
+        context.pop("youtube_channel", None)
+        context["youtube_results"] = results
+        self._sync_runtime_context_to_run(run)
+
+        if not results:
+            raise ValueError(f"No YouTube results were found for {query}.")
+        summary = self._format_youtube_results(results)
+        run.result = summary
+        self._append_event(
+            run,
+            "youtube_search",
+            f"Found {len(results)} YouTube result{'s' if len(results) != 1 else ''} for {query}.",
+            {"query": query, "filters": filters, "results": results[:5], "url": page.url},
+        )
+
+    def _rank_youtube_source_results(self, args: dict[str, Any], results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        source = self._normalize_youtube_match_text(str(args.get("channel_query") or ""))
+        content = self._normalize_youtube_match_text(str(args.get("content_query") or ""))
+        if not source or not content:
+            return results
+
+        content_tokens = set(content.split())
+        source_tokens = set(source.split())
+
+        def overlap_score(tokens: set[str], text: str) -> float:
+            if not tokens:
+                return 0.0
+            text_tokens = set(self._normalize_youtube_match_text(text).split())
+            return len(tokens & text_tokens) / len(tokens)
+
+        def score(item: dict[str, Any]) -> float:
+            title = str(item.get("title") or "")
+            channel = str(item.get("channel") or "")
+            metadata = str(item.get("metadata") or "")
+            title_norm = self._normalize_youtube_match_text(title)
+            channel_norm = self._normalize_youtube_match_text(channel)
+            source_text = f"{channel_norm} {title_norm}"
+            source_score = overlap_score(source_tokens, source_text)
+            if source and source in source_text:
+                source_score = max(source_score, 1.0)
+            content_score = overlap_score(content_tokens, f"{title} {metadata}")
+            if content and content in title_norm:
+                content_score = max(content_score, 1.0)
+            return (source_score * 0.55) + (content_score * 0.4) + (0.05 if source_score and content_score else 0.0)
+
+        return sorted(results, key=score, reverse=True)
+
+    def _youtube_filter_context(self, args: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "result_type": args.get("result_type") or "video",
+            "upload_date": args.get("upload_date") or "",
+            "duration": args.get("duration") or "",
+            "sort": args.get("sort") or "",
+            "features": args.get("features") or [],
+            "route": args.get("route") or "auto",
+            "channel_query": args.get("channel_query") or "",
+            "content_query": args.get("content_query") or "",
+            "source_qualified": bool(args.get("source_qualified")),
+        }
+
+    async def _search_youtube_channel_videos(
+        self,
+        run: AutomationRun,
+        args: dict[str, Any],
+        *,
+        explicit: bool,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
+        query = str(args.get("query") or "").strip()
+        if not query:
+            return None
+        if not explicit and self._has_youtube_topic_hint(self._normalize_prompt(query), query):
+            return None
+
+        page = await self._ensure_page()
+        search_url = f"https://www.youtube.com/results?search_query={quote_plus(query)}"
+        await page.goto(search_url, wait_until="domcontentloaded", timeout=45000)
+        run.current_url = page.url
+        await self._wait_for_youtube_ready(page)
+        await self._click_youtube_filter(page, "Channel")
+        await self._wait_for_youtube_ready(page)
+
+        candidates = await self._extract_youtube_channel_candidates(page)
+        scored = sorted(
+            (
+                (self._score_youtube_channel_candidate(query, candidate), candidate)
+                for candidate in candidates
+            ),
+            key=lambda item: item[0],
+            reverse=True,
+        )
+        threshold = 0.42 if explicit else 0.82
+        if not scored or scored[0][0] < threshold:
+            return None
+
+        channel = dict(scored[0][1])
+        channel["score"] = round(scored[0][0], 3)
+        section_url = self._youtube_channel_section_url(str(channel.get("url") or ""), args)
+        if not self._valid_http_url(section_url):
+            return None
+
+        await page.goto(section_url, wait_until="domcontentloaded", timeout=45000)
+        run.current_url = page.url
+        await self._wait_for_youtube_channel_ready(page)
+        await self._apply_youtube_channel_sort(page, args)
+        await self._wait_for_youtube_channel_ready(page)
+
+        result_type = str(args.get("result_type") or "video").lower()
+        if result_type not in {"shorts", "live"}:
+            result_type = "video"
+        results = await self._extract_youtube_results(page, result_type)
+        if not results and result_type == "live":
+            results = await self._extract_youtube_results(page, "video")
+        return (channel, results) if results else None
+
+    async def _extract_youtube_channel_candidates(self, page: Any) -> list[dict[str, Any]]:
+        candidates = await page.evaluate(
+            """
+            () => {
+              const clean = (value) => (value || "").replace(/\\s+/g, " ").trim();
+              const absolute = (href) => {
+                try { return new URL(href, location.origin).toString(); } catch { return ""; }
+              };
+              const out = [];
+              const seen = new Set();
+              const push = (item) => {
+                item.title = clean(item.title);
+                item.url = absolute(item.url);
+                item.handle = clean(item.handle);
+                item.metadata = clean(item.metadata);
+                if (!item.title || !item.url) return;
+                let parsed;
+                try { parsed = new URL(item.url); } catch { return; }
+                if (!/(^|\\.)youtube\\.com$/.test(parsed.hostname)) return;
+                if (!/^\\/(?:@|channel\\/|c\\/|user\\/)/.test(parsed.pathname)) return;
+                const key = parsed.pathname.replace(/\\/+$/, "").toLowerCase();
+                if (seen.has(key)) return;
+                seen.add(key);
+                out.push(item);
+              };
+
+              for (const card of document.querySelectorAll("ytd-channel-renderer, ytd-compact-channel-renderer, ytd-grid-channel-renderer")) {
+                const anchor = card.querySelector("a#main-link, a[href^='/@'], a[href^='/channel/'], a[href^='/c/'], a[href^='/user/']");
+                const title = card.querySelector("#channel-title, #text, yt-formatted-string")?.textContent || anchor?.textContent || "";
+                const handle = card.querySelector("#subscribers, #metadata, #video-count")?.textContent || "";
+                push({ title, url: anchor?.href || anchor?.getAttribute("href") || "", handle, metadata: card.innerText || "" });
+              }
+
+              for (const anchor of document.querySelectorAll("a[href^='/@'], a[href^='/channel/'], a[href^='/c/'], a[href^='/user/']")) {
+                const href = anchor.getAttribute("href") || "";
+                if (/\\/(feed|results|shorts|watch|playlist)(\\/|$)/.test(href)) continue;
+                const card = anchor.closest("ytd-channel-renderer, ytd-compact-channel-renderer, ytd-grid-channel-renderer") || anchor.parentElement;
+                push({
+                  title: anchor.getAttribute("title") || anchor.getAttribute("aria-label") || anchor.textContent,
+                  url: anchor.href || href,
+                  handle: href.split("/").filter(Boolean).pop() || "",
+                  metadata: card?.innerText || "",
+                });
+              }
+              return out.slice(0, 12);
+            }
+            """
+        )
+        if not isinstance(candidates, list):
+            return []
+        clean_candidates: list[dict[str, Any]] = []
+        for item in candidates:
+            if not isinstance(item, dict):
+                continue
+            title = self._clean_youtube_channel_title(str(item.get("title") or ""))[:160]
+            url = str(item.get("url") or "").strip()
+            if not title or not self._valid_http_url(url):
+                continue
+            clean_candidates.append(
+                {
+                    "title": title,
+                    "url": url,
+                    "handle": self._compact_text(str(item.get("handle") or ""))[:120],
+                    "metadata": self._compact_text(str(item.get("metadata") or ""))[:400],
+                }
+            )
+        return clean_candidates
+
+    def _clean_youtube_channel_title(self, title: str) -> str:
+        clean = self._compact_text(title)
+        clean = re.sub(r"\s+@[\w.-]+.*$", "", clean)
+        words = clean.split()
+        if len(words) >= 2 and len(words) % 2 == 0:
+            half = len(words) // 2
+            if " ".join(words[:half]).lower() == " ".join(words[half:]).lower():
+                clean = " ".join(words[:half])
+        return clean.strip()
+
+    def _score_youtube_channel_candidate(self, query: str, candidate: dict[str, Any]) -> float:
+        query_norm = self._normalize_youtube_match_text(query)
+        title_norm = self._normalize_youtube_match_text(str(candidate.get("title") or ""))
+        handle_norm = self._normalize_youtube_match_text(str(candidate.get("handle") or ""))
+        path_handle = self._normalize_youtube_match_text(urlparse(str(candidate.get("url") or "")).path.rsplit("/", 1)[-1].lstrip("@"))
+        if not query_norm or not title_norm:
+            return 0.0
+        query_compact = query_norm.replace(" ", "")
+        title_compact = title_norm.replace(" ", "")
+        handle_compact = handle_norm.replace(" ", "")
+        path_compact = path_handle.replace(" ", "")
+        if query_norm in {title_norm, handle_norm, path_handle}:
+            return 1.0
+        if query_compact and query_compact in {title_compact, handle_compact, path_compact}:
+            return 1.0
+        if title_norm.startswith(query_norm) or path_handle.startswith(query_norm):
+            return 0.94
+        if query_compact and (title_compact.startswith(query_compact) or path_compact.startswith(query_compact)):
+            return 0.94
+        if query_norm in title_norm or query_norm in path_handle:
+            return 0.88
+        if query_compact and (query_compact in title_compact or query_compact in path_compact):
+            return 0.88
+
+        query_tokens = set(query_norm.split())
+        candidate_tokens = set(title_norm.split()) | set(handle_norm.split()) | set(path_handle.split())
+        if not query_tokens or not candidate_tokens:
+            return 0.0
+        overlap = len(query_tokens & candidate_tokens)
+        recall = overlap / len(query_tokens)
+        precision = overlap / len(candidate_tokens)
+        if recall <= 0:
+            return 0.0
+        return max(0.0, min(0.84, (recall * 0.72) + (precision * 0.18)))
+
+    def _normalize_youtube_match_text(self, value: str) -> str:
+        normalized = re.sub(r"[^a-z0-9]+", " ", (value or "").lower())
+        normalized = re.sub(r"\b(official|youtube|channel|videos?)\b", " ", normalized)
+        return re.sub(r"\s+", " ", normalized).strip()
+
+    def _youtube_channel_section_url(self, channel_url: str, args: dict[str, Any]) -> str:
+        if not self._valid_http_url(channel_url):
+            return ""
+        parsed = urlparse(channel_url)
+        path = re.sub(r"/(?:videos|shorts|streams|featured|about|community)/?$", "", parsed.path.rstrip("/"), flags=re.IGNORECASE)
+        if not path:
+            path = parsed.path.rstrip("/")
+        result_type = str(args.get("result_type") or "video").lower()
+        section = "videos"
+        if result_type == "shorts":
+            section = "shorts"
+        elif result_type == "live":
+            section = "streams"
+        return f"{parsed.scheme}://{parsed.netloc}{path}/{section}"
+
+    async def _wait_for_youtube_channel_ready(self, page: Any) -> None:
+        try:
+            await page.wait_for_selector("ytd-rich-grid-media, ytd-rich-item-renderer, a#video-title-link, a[href*='/watch'], a[href*='/shorts/']", timeout=18000)
+        except Exception:
+            await page.wait_for_timeout(1500)
+
+    async def _apply_youtube_channel_sort(self, page: Any, args: dict[str, Any]) -> None:
+        sort = str(args.get("sort") or "").lower()
+        upload_date = str(args.get("upload_date") or "").lower()
+        if sort == "view_count":
+            await self._click_youtube_chip(page, "Popular")
+        elif sort == "upload_date" or upload_date in {"hour", "today", "week", "month", "year", "recent"}:
+            if not await self._click_youtube_chip(page, "Latest"):
+                await self._click_youtube_chip(page, "Recently uploaded")
+
+    async def _tool_youtube_result(self, run: AutomationRun, args: dict[str, Any]) -> None:
+        mode = str(args.get("mode") or "list").strip().lower()
+        index = max(1, int(args.get("index") or 1))
+        context = self._runtime_context_for(run)
+        results = context.get("youtube_results") if isinstance(context.get("youtube_results"), list) else []
+        if not results:
+            page = await self._ensure_page()
+            results = await self._extract_youtube_results(page, "video")
+            context["youtube_results"] = results
+            self._sync_runtime_context_to_run(run)
+        if not results:
+            raise ValueError("No YouTube video results are available.")
+
+        selected = results[min(index - 1, len(results) - 1)]
+        title = str(selected.get("title") or "").strip()
+        url = str(selected.get("url") or "").strip()
+        if not title:
+            raise ValueError("The selected YouTube result did not expose a title.")
+
+        if mode == "name":
+            run.result = title
+            self._append_event(run, "youtube_title", title, {"result": selected, "index": index})
+            return
+
+        if mode == "play":
+            if not self._valid_http_url(url):
+                raise ValueError("The selected YouTube result did not expose a playable URL.")
+            page = await self._ensure_page()
+            await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            run.current_url = page.url
+            run.result = f"Playing: {title}"
+            self._append_event(run, "youtube_playing", f"Playing: {title}", {"result": selected, "url": page.url, "index": index})
+            return
+
+        summary = self._format_youtube_results(results)
+        run.result = summary
+        self._append_event(run, "youtube_results", summary, {"results": results[:10], "index": index})
+
+    async def _wait_for_youtube_ready(self, page: Any) -> None:
+        try:
+            await page.wait_for_selector("ytd-video-renderer, ytd-channel-renderer, ytd-playlist-renderer, ytd-reel-shelf-renderer, ytd-rich-grid-media, a#video-title, a#video-title-link, a[href*='/shorts/']", timeout=18000)
+        except Exception:
+            await page.wait_for_timeout(1200)
+
+    async def _apply_youtube_filters(self, page: Any, args: dict[str, Any]) -> None:
+        result_type = str(args.get("result_type") or "video").lower()
+        upload_date = str(args.get("upload_date") or "").lower()
+        duration = str(args.get("duration") or "").lower()
+        sort = str(args.get("sort") or "").lower()
+
+        if result_type == "shorts":
+            await self._click_youtube_chip(page, "Shorts")
+        elif result_type == "live":
+            await self._click_youtube_chip(page, "Live")
+        elif result_type == "video":
+            await self._click_youtube_chip(page, "Videos")
+        elif result_type == "channel":
+            await self._click_youtube_filter(page, "Channel")
+        elif result_type == "playlist":
+            await self._click_youtube_filter(page, "Playlist")
+
+        if upload_date == "recent" or sort == "upload_date":
+            if not await self._click_youtube_chip(page, "Recently uploaded"):
+                await self._click_youtube_filter(page, "Upload date")
+        upload_labels = {
+            "hour": "Last hour",
+            "today": "Today",
+            "week": "This week",
+            "month": "This month",
+            "year": "This year",
+        }
+        if upload_date in upload_labels:
+            await self._click_youtube_filter(page, upload_labels[upload_date])
+
+        duration_labels = {"short": "Under 4 minutes", "medium": "4 - 20 minutes", "long": "Over 20 minutes"}
+        if duration in duration_labels:
+            await self._click_youtube_filter(page, duration_labels[duration])
+
+        sort_labels = {"view_count": "View count", "rating": "Rating"}
+        if sort in sort_labels:
+            await self._click_youtube_filter(page, sort_labels[sort])
+
+    async def _click_youtube_chip(self, page: Any, label: str) -> bool:
+        patterns = [
+            page.get_by_role("button", name=re.compile(rf"^{re.escape(label)}$", re.IGNORECASE)),
+            page.locator("yt-chip-cloud-chip-renderer").filter(has_text=re.compile(rf"^{re.escape(label)}$", re.IGNORECASE)),
+            page.get_by_text(label, exact=True),
+        ]
+        for locator in patterns:
+            try:
+                await locator.first.click(timeout=2500)
+                await page.wait_for_timeout(900)
+                return True
+            except Exception:
+                continue
+        return False
+
+    async def _click_youtube_filter(self, page: Any, label: str) -> bool:
+        try:
+            await page.get_by_role("button", name=re.compile(r"filters?", re.IGNORECASE)).first.click(timeout=3000)
+            await page.wait_for_timeout(400)
+        except Exception:
+            pass
+        variants = [label]
+        if label.lower() == "channel":
+            variants.append("Channels")
+        elif label.lower() == "playlist":
+            variants.append("Playlists")
+        for variant in variants:
+            pattern = re.compile(rf"^{re.escape(variant)}$", re.IGNORECASE)
+            for locator in (
+                page.locator("ytd-search-filter-renderer").filter(has_text=pattern).locator("a"),
+                page.locator("ytd-search-filter-options-dialog-renderer").get_by_text(pattern),
+                page.get_by_role("link", name=pattern),
+                page.get_by_text(variant, exact=True),
+            ):
+                try:
+                    await locator.first.click(timeout=3000)
+                    await page.wait_for_timeout(1200)
+                    return True
+                except Exception:
+                    try:
+                        await locator.first.click(timeout=1500, force=True)
+                        await page.wait_for_timeout(1200)
+                        return True
+                    except Exception:
+                        continue
+        return False
+
+    async def _extract_youtube_results(self, page: Any, result_type: str = "video") -> list[dict[str, Any]]:
+        desired_type = (result_type or "video").lower()
+        results = await page.evaluate(
+            """
+            (desiredType) => {
+              const clean = (value) => (value || "").replace(/\\s+/g, " ").trim();
+              const absolute = (href) => {
+                try { return new URL(href, location.origin).toString(); } catch { return ""; }
+              };
+              const seen = new Set();
+              const out = [];
+              const push = (item) => {
+                item.title = clean(item.title);
+                item.url = absolute(item.url);
+                item.channel = clean(item.channel);
+                item.metadata = clean(item.metadata);
+                if (!item.title || !item.url) return;
+                const titleKey = item.title.toLowerCase();
+                if (["shorts", "live", "upcoming", "course", "playlist", "view full course"].includes(titleKey) || titleKey.includes("now playing") || /^\\d{1,2}:\\d{2}(?::\\d{2})?(?:\\s+\\d{1,2}:\\d{2})?$/.test(titleKey)) return;
+                try {
+                  const parsedUrl = new URL(item.url, location.origin);
+                  if (parsedUrl.pathname.replace(/\\/+$/, "") === "/shorts") return;
+                } catch {}
+                let key = item.url;
+                try {
+                  const parsedForKey = new URL(item.url, location.origin);
+                  if (item.type === "playlist") key = `playlist:${parsedForKey.searchParams.get("list") || parsedForKey.pathname + parsedForKey.search}`;
+                } catch {}
+                if (seen.has(key)) return;
+                seen.add(key);
+                out.push(item);
+              };
+
+              for (const card of document.querySelectorAll("ytd-channel-renderer, ytd-compact-channel-renderer, ytd-grid-channel-renderer")) {
+                const anchor = card.querySelector("a#main-link, a[href^='/@'], a[href^='/channel/'], a[href^='/c/'], a[href^='/user/']");
+                const title = card.querySelector("#channel-title, #text, yt-formatted-string")?.textContent || anchor?.getAttribute("title") || anchor?.textContent || "";
+                const metadata = card.querySelector("#metadata, #subscribers, #video-count")?.innerText || card.innerText || "";
+                push({
+                  title,
+                  url: anchor?.href || anchor?.getAttribute("href") || "",
+                  channel: "",
+                  metadata,
+                  type: "channel",
+                });
+              }
+
+              if (desiredType === "channel") {
+                for (const anchor of document.querySelectorAll("a[href^='/@'], a[href^='/channel/'], a[href^='/c/'], a[href^='/user/']")) {
+                  const href = anchor.getAttribute("href") || "";
+                  if (/\\/(feed|results|shorts|watch|playlist)(\\/|$)/.test(href)) continue;
+                  const card = anchor.closest("ytd-channel-renderer, ytd-compact-channel-renderer, ytd-grid-channel-renderer, ytd-video-renderer, ytd-rich-item-renderer") || anchor.parentElement;
+                  const aria = clean(anchor.getAttribute("aria-label") || "").replace(/^go to channel\\s+/i, "");
+                  const title = anchor.getAttribute("title") || anchor.textContent || aria;
+                  push({
+                    title,
+                    url: anchor.href || href,
+                    channel: "",
+                    metadata: card?.innerText || "",
+                    type: "channel",
+                  });
+                }
+              }
+
+              for (const card of document.querySelectorAll("ytd-playlist-renderer, ytd-radio-renderer")) {
+                const anchor = card.querySelector("a[href*='list='], a#video-title, h3 a");
+                const title = card.querySelector("#playlist-title, h3, .yt-lockup-metadata-view-model__title, #video-title")?.textContent || anchor?.getAttribute("title") || anchor?.textContent || "";
+                const owner = card.querySelector("ytd-channel-name a, #channel-name a, .yt-lockup-metadata-view-model__metadata")?.textContent || "";
+                push({
+                  title,
+                  url: anchor?.href || anchor?.getAttribute("href") || "",
+                  channel: owner,
+                  metadata: card.innerText || "",
+                  type: "playlist",
+                });
+              }
+
+              for (const anchor of document.querySelectorAll("a[href*='/playlist?list='], a[href*='list=']")) {
+                const card = anchor.closest("ytd-playlist-renderer, ytd-radio-renderer, ytd-rich-item-renderer, ytd-video-renderer, ytd-rich-grid-media, ytd-item-section-renderer") || anchor.parentElement;
+                const title = card?.querySelector("#playlist-title, h3, .yt-lockup-metadata-view-model__title, #video-title")?.textContent || anchor.getAttribute("title") || anchor.getAttribute("aria-label") || anchor.textContent || "";
+                push({
+                  title,
+                  url: anchor.href || anchor.getAttribute("href") || "",
+                  channel: card?.querySelector("ytd-channel-name a, #channel-name a")?.textContent || "",
+                  metadata: card?.innerText || "",
+                  type: "playlist",
+                });
+              }
+
+              const videoAnchors = Array.from(document.querySelectorAll("a#video-title[href*='/watch'], a#video-title-link[href*='/watch'], ytd-video-renderer a[href*='/watch'], ytd-rich-item-renderer a[href*='/watch']"));
+              for (const anchor of videoAnchors) {
+                const card = anchor.closest("ytd-video-renderer, ytd-rich-grid-media, ytd-rich-item-renderer, ytd-compact-video-renderer") || anchor.parentElement;
+                const text = clean(card?.innerText || "");
+                const badges = text.toLowerCase();
+                const isLive = /\\blive\\b|watching now/.test(badges);
+                push({
+                  title: anchor.getAttribute("title") || card?.querySelector("#video-title, #video-title-link, h3, .yt-lockup-metadata-view-model__title")?.textContent || anchor.getAttribute("aria-label") || anchor.textContent,
+                  url: anchor.href,
+                  channel: card?.querySelector("ytd-channel-name a, #channel-name a")?.textContent || "",
+                  metadata: card?.querySelector("#metadata-line")?.innerText || text.split("\\n").slice(1, 5).join(" "),
+                  type: isLive ? "live" : "video",
+                });
+              }
+
+              const shortAnchors = Array.from(document.querySelectorAll("a[href*='/shorts/']"));
+              for (const anchor of shortAnchors) {
+                const card = anchor.closest("ytd-reel-item-renderer, ytd-reel-video-renderer, ytd-rich-item-renderer, ytd-video-renderer") || anchor.parentElement;
+                push({
+                  title: anchor.getAttribute("title") || anchor.getAttribute("aria-label") || card?.querySelector("#video-title, .yt-lockup-metadata-view-model__title")?.textContent || card?.innerText?.split("\\n")?.[0],
+                  url: anchor.href,
+                  channel: card?.querySelector("ytd-channel-name a, #channel-name a")?.textContent || "",
+                  metadata: card?.innerText || "",
+                  type: "shorts",
+                });
+              }
+
+              return out
+                .filter((item) => {
+                  if (desiredType === "all") return true;
+                  if (desiredType === "shorts") return item.type === "shorts";
+                  if (desiredType === "live") return item.type === "live";
+                  if (desiredType === "video") return item.type === "video";
+                  if (desiredType === "channel") return item.type === "channel";
+                  if (desiredType === "playlist") return item.type === "playlist";
+                  return item.type === "video";
+                })
+                .slice(0, 12);
+            }
+            """,
+            desired_type,
+        )
+        if not isinstance(results, list):
+            return []
+        clean_results: list[dict[str, Any]] = []
+        seen_titles: set[str] = set()
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("type") or "video").strip()[:20]
+            title = self._clean_youtube_title(str(item.get("title") or "").strip(), item_type)
+            if item_type == "channel":
+                title = self._clean_youtube_channel_title(title)
+            url = str(item.get("url") or "").strip()
+            if not title or self._bad_youtube_title(title) or not self._valid_http_url(url):
+                continue
+            title_key = f"{item_type}:{self._normalize_youtube_match_text(title)}"
+            if title_key in seen_titles:
+                continue
+            seen_titles.add(title_key)
+            metadata_limit = 220 if item_type in {"channel", "playlist"} else 500
+            clean_results.append(
+                {
+                    "title": title[:300],
+                    "url": url,
+                    "channel": str(item.get("channel") or "").strip()[:120],
+                    "metadata": self._compact_text(str(item.get("metadata") or ""))[:metadata_limit],
+                    "type": item_type,
+                }
+            )
+        return clean_results
+
+    def _clean_youtube_title(self, title: str, result_type: str = "video") -> str:
+        clean = re.sub(r"\s+", " ", title or "").strip()
+        clean = re.sub(r"\s+\d+\s+hours?,\s+\d+\s+minutes?\s*$", "", clean, flags=re.IGNORECASE)
+        clean = re.sub(r"\s+\d+(?:\.\d+)?\s+(?:seconds?|minutes?|hours?)\s*,?\s*$", "", clean, flags=re.IGNORECASE)
+        if result_type == "shorts":
+            clean = re.sub(r"^New(?=[A-Z0-9])", "", clean)
+            clean = re.sub(r"\s*\d+(?:\.\d+)?[KMB]?\s*views?\s*$", "", clean, flags=re.IGNORECASE)
+        return clean.strip()
+
+    def _bad_youtube_title(self, title: str) -> bool:
+        clean = re.sub(r"\s+", " ", title or "").strip().lower()
+        return bool(clean in {"shorts", "live", "upcoming", "course", "playlist", "view full course"} or "now playing" in clean or re.fullmatch(r"\d{1,2}:\d{2}(?::\d{2})?(?:\s+\d{1,2}:\d{2})?", clean))
+
+    def _format_youtube_results(self, results: list[dict[str, Any]]) -> str:
+        lines = []
+        for index, item in enumerate(results[:5], start=1):
+            detail = " - ".join(part for part in [str(item.get("channel") or "").strip(), str(item.get("metadata") or "").strip()] if part)
+            suffix = f" ({detail})" if detail else ""
+            lines.append(f"{index}. {item.get('title')}{suffix}")
+        return "YouTube results:\n" + "\n".join(lines)
 
     async def _tool_browser_click(self, run: AutomationRun, args: dict[str, Any]) -> None:
         page = await self._ensure_page()

@@ -27,6 +27,10 @@ class Settings(BaseSettings):
     piper_noise_scale: float = 0.667
     piper_noise_w_scale: float = 0.8
     piper_volume: float = 0.95
+    stt_model: str = "tiny.en"
+    stt_language: str = "en"
+    stt_compute_type: str = "int8"
+    stt_max_upload_bytes: int = 15_000_000
     reports_dir: str = "reports"
     data_dir: str = "data"
     astra_openrpa_exe: str = ""
