@@ -187,23 +187,27 @@ class MockTestIntelligenceService:
         if doc_blueprint:
             return doc_blueprint, setup_required
 
+        if self.llm.provider_for_model() == "nvidia":
+            return self._blueprint_from_request(request, "request:nvidia_fast_path"), setup_required
+
         llm_blueprint, llm_setup = await self._blueprint_from_llm(request)
         setup_required.extend(llm_setup)
         if llm_blueprint:
             return llm_blueprint, []
 
+        return self._blueprint_from_request(request, "missing_llm"), sorted(set(setup_required or [self.llm.missing_setup_for_model()]))
+
+    def _blueprint_from_request(self, request: MockTestGenerateRequest, source: str) -> MockBlueprint:
         topic = request.topic.strip() or "General Practice"
-        return (
-            MockBlueprint(
-                topic=topic,
-                generation_mode="topic_practice",
-                blueprint_source="missing_llm",
-                syllabus_units=[topic],
-                expected_terms=self._terms(topic),
-                confidence=0.2,
-                quality_warnings=["No local profile, source syllabus, or LLM blueprint was available."],
-            ),
-            sorted(set(setup_required or ["CEREBRAS_API_KEY"])),
+        terms = self._terms(" ".join([topic, request.source_query, *request.constraints]))
+        return MockBlueprint(
+            topic=topic,
+            generation_mode="topic_practice",
+            blueprint_source=source,
+            syllabus_units=[topic],
+            expected_terms=terms,
+            confidence=0.35 if source != "missing_llm" else 0.2,
+            quality_warnings=["Using request terms as the generation blueprint."],
         )
 
     def profile_questions(self, request: MockTestGenerateRequest, blueprint: MockBlueprint) -> list[MockQuestion]:
@@ -211,6 +215,8 @@ class MockTestIntelligenceService:
         selected_templates: list[dict[str, Any]] = []
         unit_text = " ".join([request.topic, blueprint.exam, blueprint.subject, *blueprint.syllabus_units]).lower()
         for key, templates in pool.items():
+            if blueprint.subject == "Cyber Security" and key != "cyber":
+                continue
             if key == "science" and "school" not in unit_text and self._normalize(blueprint.subject) != "science":
                 continue
             if key == "data" and not re.search(r"\bdata\s+structures?\b", unit_text):
@@ -332,8 +338,8 @@ class MockTestIntelligenceService:
         )
 
     async def _blueprint_from_llm(self, request: MockTestGenerateRequest) -> tuple[MockBlueprint | None, list[str]]:
-        if not self.settings.has_cerebras:
-            return None, ["CEREBRAS_API_KEY"]
+        if not self.llm.model_configured():
+            return None, [self.llm.missing_setup_for_model()]
         system_prompt = (
             "You are Astra's exam syllabus planner. Return strict JSON only. "
             "Infer the exam/topic syllabus and pattern for MCQ practice. Do not generate questions here. "
@@ -797,6 +803,38 @@ class MockTestIntelligenceService:
                 expected_terms=("normalization", "b+ tree", "transaction", "sql", "key", "relation", "locking", "concurrency", "er model", "deadlock", "cache", "dfa", "complexity", "subnet", "pipeline"),
             ),
             ExamProfile(
+                id="cyber_security",
+                exam="",
+                subject="Cyber Security",
+                aliases=("cyber security", "cybersecurity", "information security", "security numerical", "cyber security numerical"),
+                syllabus_units=(
+                    "Quantitative Risk Analysis",
+                    "Cryptographic Mathematics",
+                    "Password Entropy",
+                    "Network Security Calculations",
+                    "Vulnerability Scoring",
+                    "Security Operations Metrics",
+                ),
+                question_style="Cyber security MCQs with quantitative risk, cryptography, entropy, and network-security calculations.",
+                expected_terms=(
+                    "cyber",
+                    "security",
+                    "risk",
+                    "ale",
+                    "sle",
+                    "aro",
+                    "rsa",
+                    "modular",
+                    "entropy",
+                    "brute force",
+                    "firewall",
+                    "cvss",
+                    "vulnerability",
+                    "incident",
+                    "availability",
+                ),
+            ),
+            ExamProfile(
                 id="dsa",
                 exam="",
                 subject="Data Structures and Algorithms",
@@ -1010,6 +1048,24 @@ class MockTestIntelligenceService:
 
     def _question_pool(self) -> dict[str, list[dict[str, Any]]]:
         return {
+            "cyber": [
+                self._q("Calculate ALE when SLE is 5000 and ARO is 0.20 for a cyber security asset.", ["1000", "5200", "25000", "0.04"], 0, "Annualized Loss Expectancy is SLE x ARO, so 5000 x 0.20 = 1000.", ["cyber security", "risk", "ale"], "medium"),
+                self._q("A firewall blocks 45 malicious requests out of 50. Determine the detection rate.", ["90%", "45%", "10%", "5%"], 0, "The firewall detection rate is 45 / 50 = 0.90, or 90%.", ["firewall", "cyber security", "security metrics"], "medium"),
+                self._q("A password uses 8 symbols from a 16-character alphabet. Calculate its entropy.", ["32 bits", "16 bits", "64 bits", "128 bits"], 0, "Entropy is 8 x log2(16), and log2(16) = 4, so the password has 32 bits.", ["cyber security", "entropy", "password"], "medium"),
+                self._q("A security service promises 99% availability over 1000 monitored minutes. Determine the allowed downtime.", ["10 minutes", "1 minute", "99 minutes", "100 minutes"], 0, "Downtime is 1% of 1000 minutes, which equals 10 minutes.", ["availability", "cyber security", "security metrics"], "medium"),
+                self._q("An asset has SLE = 50000 and ARO = 0.20. A security control costs 8000 per year and lowers ARO to 0.05. What is the net annual value of the control?", ["-500", "2500", "7500", "8000"], 0, "Original ALE is 50000 x 0.20 = 10000. New ALE is 50000 x 0.05 = 2500, so savings are 7500 and net value is 7500 - 8000 = -500.", ["cyber security", "risk", "ale"], "hard"),
+                self._q("For RSA, p = 17, q = 19, and public exponent e = 5. Determine the private exponent d modulo phi(n).", ["173", "115", "57", "283"], 0, "Here phi(n) = 16 x 18 = 288. The inverse of 5 modulo 288 is 173 because 5 x 173 = 865 = 3 x 288 + 1.", ["rsa", "modular", "cryptography"], "hard"),
+                self._q("A password policy uses 12 independent characters from an alphabet of 62 symbols. Calculate the approximate password entropy.", ["71.45 bits", "62 bits", "48 bits", "744 bits"], 0, "Entropy is length x log2(alphabet size), so 12 x log2(62) is about 12 x 5.954 = 71.45 bits.", ["cyber security", "entropy", "password"], "hard"),
+                self._q("A brute-force attack must search 2^40 keys and can test 2^20 keys per second. Calculate the expected full-search time.", ["2^20 seconds", "2^60 seconds", "20 seconds", "2^30 seconds"], 0, "Time equals keyspace divided by rate: 2^40 / 2^20 = 2^20 seconds, which is about 12.1 days.", ["brute force", "keyspace", "cyber security"], "hard"),
+                self._q("A 64-bit security MAC is checked against 2^20 forged messages. Using the birthday approximation n^2 / 2^(b+1), calculate the collision probability.", ["About 2^-25", "About 2^-44", "About 2^-64", "About 2^-5"], 0, "With n = 2^20 and b = 64, n^2 / 2^(b+1) = 2^40 / 2^65 = 2^-25.", ["mac", "collision", "cyber security"], "hard"),
+                self._q("A firewall drops 1800 malicious packets out of 2000 malicious packets and also blocks 100 legitimate packets out of 10000. Determine the false positive rate.", ["1%", "5%", "10%", "90%"], 0, "False positive rate uses legitimate traffic: 100 false positives out of 10000 legitimate packets equals 100 / 10000 = 1%.", ["firewall", "security metrics", "false positive"], "hard"),
+                self._q("A vulnerability has exploitability 8 and impact 7. If a simplified risk score is exploitability x impact / 10, determine the score.", ["5.6", "15", "56", "1.14"], 0, "The simplified vulnerability score is 8 x 7 / 10 = 5.6.", ["vulnerability", "risk", "cvss"], "hard"),
+                self._q("A system with 99.9% monthly availability is observed for a 30-day month. Approximately how many minutes of downtime are allowed?", ["43.2 minutes", "4.32 minutes", "432 minutes", "0.432 minutes"], 0, "A 30-day month has 30 x 24 x 60 = 43200 minutes. Downtime at 0.1% is 43.2 minutes.", ["availability", "security operations", "downtime"], "hard"),
+                self._q("An IDS processes 50000 events and raises 250 alerts. Analysts confirm 40 true incidents. Determine what percentage of alerts were true positives.", ["16%", "8%", "0.08%", "84%"], 0, "True-positive alert percentage is confirmed incidents divided by alerts: 40 / 250 = 0.16, or 16%.", ["ids", "incident", "security metrics"], "hard"),
+                self._q("A control reduces annual incident probability from 0.30 to 0.12 for an incident impact of 40000. If the control costs 5000 yearly, what is the annualized net benefit?", ["2200", "7200", "12000", "-5000"], 0, "Risk reduction savings are (0.30 - 0.12) x 40000 = 7200. Net benefit is 7200 - 5000 = 2200.", ["cyber security", "risk", "control"], "hard"),
+                self._q("In RSA with p = 11 and q = 13, what is phi(n), the totient used for key generation?", ["120", "143", "24", "132"], 0, "For RSA, phi(n) = (p - 1)(q - 1) = 10 x 12 = 120.", ["rsa", "cryptography", "totient"], "hard"),
+                self._q("A security scan finds 36 critical vulnerabilities in 900 hosts. What is the critical vulnerability density per 100 hosts?", ["4", "2.5", "25", "0.4"], 0, "Density per 100 hosts is 36 / 900 x 100 = 4 critical vulnerabilities per 100 hosts.", ["vulnerability", "security metrics", "density"], "hard"),
+            ],
             "discrete": [
                 self._q("How many distinct permutations can be formed from the letters of MATH?", ["24", "12", "16", "8"], 0, "MATH has four distinct letters, so the count is 4! = 24.", ["discrete mathematics", "permutation"], "easy"),
                 self._q("How many 3-member committees can be formed from 8 people?", ["56", "24", "336", "11"], 0, "The number of committees is C(8,3) = 8 x 7 x 6 / (3 x 2 x 1) = 56.", ["combination", "counting"], "medium"),

@@ -7,9 +7,18 @@ from types import SimpleNamespace
 import pytest
 
 from app.config import Settings
-from app.models import AutomationCancelRequest, AutomationConfirmRequest, AutomationRecipeCreateRequest, AutomationRun, AutomationRunRequest
+from app.models import (
+    AutomationCancelRequest,
+    AutomationConfirmRequest,
+    AutomationContinueRequest,
+    AutomationRecipeCreateRequest,
+    AutomationRun,
+    AutomationRunRequest,
+    LlmProfileConfig,
+    LlmSettingsUpdateRequest,
+)
 from app.services.automations import AutomationCancelledError, AutomationService, VIDEO_DOWNLOAD_FALLBACK_FORMAT_SELECTOR
-from app.services.llm import LlmService
+from app.services.llm import NVIDIA_PRO_MODELS, LlmService
 from app.services.windows_automation import WindowsAutomationResult
 
 
@@ -21,6 +30,51 @@ def build_service(tmp_path):
     )
     settings.cerebras_api_key = ""
     return AutomationService(settings, LlmService(settings))
+
+
+class FakeWindowsDesktop:
+    def __init__(self):
+        self.calls: list[tuple[str, str]] = []
+
+    def open_app(self, app_name: str):
+        self.calls.append(("open_app", app_name))
+        return WindowsAutomationResult(True, "app_opened", f"Opened {app_name}.", {"app": app_name})
+
+    def find_text(self, text: str, app_name: str = "", timeout: int = 8, control_types=None, exclude_control_types=None):
+        self.calls.append(("find_text", text))
+        return WindowsAutomationResult(
+            True,
+            "desktop_text_found",
+            f"Found '{text}'.",
+            {
+                "target": {
+                    "text": text,
+                    "control_type": "Text",
+                    "window_title": app_name or "Desktop",
+                    "rect": {"left": 10, "top": 10, "right": 80, "bottom": 40},
+                }
+            },
+        )
+
+    def click_target(self, target=None, text: str = "", button: str = "left"):
+        self.calls.append(("click_target", text or str(target)))
+        return WindowsAutomationResult(True, "desktop_clicked", "Clicked the desktop target.", {"target": target})
+
+    def type_text(self, text: str, replace: bool = False):
+        self.calls.append(("type_text", text))
+        return WindowsAutomationResult(True, "desktop_typed", "Typed text into the focused desktop control.", {"text_length": len(text), "replace": replace})
+
+    def press_key(self, key: str):
+        self.calls.append(("press_key", key))
+        return WindowsAutomationResult(True, "desktop_key_pressed", f"Pressed {key}.", {"key": key})
+
+    def prepare_whatsapp_message(self, contact: str, message: str):
+        self.calls.append(("prepare_whatsapp_message", f"{contact}:{message}"))
+        return WindowsAutomationResult(True, "whatsapp_prepared", f"Prepared WhatsApp message to {contact}.", {"contact": contact, "message_length": len(message)})
+
+    def verify_text(self, text: str, app_name: str = "", timeout: int = 6):
+        self.calls.append(("verify_text", text))
+        return WindowsAutomationResult(True, "desktop_verified", f"Verified '{text}' is visible.", {"text": text, "app": app_name})
 
 
 async def wait_for_run(service: AutomationService, run_id: str, statuses: set[str], timeout: float = 3.0):
@@ -40,9 +94,100 @@ def test_recipe_crud(tmp_path):
     recipe = service.create_recipe(AutomationRecipeCreateRequest(name="Daily Search", prompt="search ai news", steps=[]))
 
     assert service.list_recipes()[0].id == recipe.id
+    assert recipe.status == "executable"
     assert service.get_recipe(recipe.id) is not None
     assert service.delete_recipe(recipe.id) is True
     assert service.list_recipes() == []
+
+
+@pytest.mark.asyncio
+async def test_recipe_builder_uses_clarified_goal_not_wrapper_prompt(tmp_path):
+    service = build_service(tmp_path)
+
+    run = await service.start_run(AutomationRunRequest(prompt="Create a new reusable automation.", create_recipe=True))
+    waiting = await wait_for_run(service, run.id, {"waiting_for_user"})
+
+    assert "What kind of automation" in waiting.events[-1].message
+
+    await service.continue_run(run.id, AutomationContinueRequest(note="open whatsapp app and send hiii to bebo2"))
+    finished = await wait_for_run(service, run.id, {"complete"})
+    recipes = service.list_recipes()
+
+    assert finished.recipe_id
+    assert recipes[0].prompt == "open whatsapp app and send hiii to bebo2"
+    assert recipes[0].name == "Send WhatsApp message"
+    assert recipes[0].status == "executable"
+    assert recipes[0].missing_tools == []
+    assert "Create a new reusable automation" not in recipes[0].prompt
+
+
+@pytest.mark.asyncio
+async def test_recipe_builder_saves_direct_whatsapp_goal_as_executable_desktop_recipe(tmp_path):
+    service = build_service(tmp_path)
+
+    run = await service.start_run(AutomationRunRequest(prompt='open whatsapp app and send message "hello" to bebo 2', create_recipe=True))
+    finished = await wait_for_run(service, run.id, {"complete"})
+    recipe = service.get_recipe(finished.recipe_id)
+
+    assert recipe is not None
+    assert recipe.status == "executable"
+    assert recipe.risk == "safe_confirm"
+    assert [step["tool"] for step in recipe.steps][:2] == ["app.resolve", "app.open"]
+    assert "desktop.press_key" in [step["tool"] for step in recipe.steps]
+    assert "system.ask_user" not in [step["tool"] for step in recipe.steps]
+
+
+@pytest.mark.asyncio
+async def test_direct_message_prompt_uses_desktop_plan_before_llm(tmp_path):
+    service = build_service(tmp_path)
+
+    steps = await service._plan_steps('open whatsapp app and send message "hello" to bebo 2')
+    tools = [step["tool"] for step in steps]
+
+    assert tools[:2] == ["app.resolve", "app.open"]
+    assert "windows.prepare_whatsapp_message" in tools
+    assert "desktop.press_key" in tools
+    assert tools[-1] == "desktop.verify_text"
+
+
+@pytest.mark.asyncio
+async def test_direct_message_run_waits_for_send_confirmation_before_pressing_enter(tmp_path):
+    service = build_service(tmp_path)
+    fake_windows = FakeWindowsDesktop()
+    service.windows = fake_windows  # type: ignore[assignment]
+
+    run = await service.start_run(AutomationRunRequest(prompt='open whatsapp app and send message "hello" to bebo 2'))
+    waiting = await wait_for_run(service, run.id, {"confirmation_required"})
+
+    assert waiting.confirmation is not None
+    assert ("prepare_whatsapp_message", "bebo 2:hello") in fake_windows.calls
+    assert ("press_key", "enter") not in fake_windows.calls
+
+    await service.confirm_run(run.id, AutomationConfirmRequest(approved=True))
+    finished = await wait_for_run(service, run.id, {"complete"})
+
+    assert ("press_key", "enter") in fake_windows.calls
+    assert ("verify_text", "hello") in fake_windows.calls
+    assert finished.result == "Verified 'hello' is visible."
+
+
+@pytest.mark.asyncio
+async def test_non_executable_recipe_does_not_falsely_run(tmp_path):
+    service = build_service(tmp_path)
+    recipe = service.create_recipe(
+        AutomationRecipeCreateRequest(
+            name="Send WhatsApp message",
+            prompt="open whatsapp app and send hiii to bebo2",
+            steps=[{"tool": "desktop.find_text", "description": "Find contact.", "args": {"text": "bebo2"}}],
+            status="needs_tools",
+            missing_tools=["desktop.find_text"],
+        )
+    )
+
+    run = await service.start_run(AutomationRunRequest(prompt=" ", recipe_id=recipe.id))
+    finished = await wait_for_run(service, run.id, {"error"})
+
+    assert "not executable yet" in finished.error
 
 
 def test_sanitize_steps_keeps_only_allowed_tools_and_safe_python(tmp_path):
@@ -82,6 +227,32 @@ async def test_planner_falls_back_when_llm_returns_empty_content(tmp_path):
     assert steps[0]["args"]["site"] == "youtube"
 
 
+@pytest.mark.asyncio
+async def test_planner_uses_configured_pro_profile_for_llm_fallback(tmp_path):
+    service = build_service(tmp_path)
+    service.settings.nvidia_api_key = "configured"
+    service.llm.update_settings(
+        LlmSettingsUpdateRequest(
+            profiles={
+                "fast": LlmProfileConfig(provider="cerebras", model="llama3.1-8b"),
+                "pro": LlmProfileConfig(provider="nvidia", model=NVIDIA_PRO_MODELS[0]),
+            }
+        )
+    )
+    called_models = []
+
+    async def fake_complete(_system_prompt, _user_prompt, model=None):
+        called_models.append(model)
+        return '{"steps":[{"tool":"browser.search","description":"Search the web.","args":{"site":"google","query":"ai automation"}}]}', []
+
+    service.llm.complete = fake_complete
+
+    steps = await service._plan_steps("research a safe browser automation flow for ai automation")
+
+    assert called_models == [f"nvidia:{NVIDIA_PRO_MODELS[0]}"]
+    assert steps[0]["tool"] == "browser.search"
+
+
 def test_youtube_download_plan_opens_result_before_official_download(tmp_path):
     service = build_service(tmp_path)
 
@@ -96,9 +267,169 @@ def test_direct_youtube_download_plan_uses_video_url_without_search(tmp_path):
 
     steps = service._heuristic_plan("download this video https://www.youtube.com/watch?v=MhUS3zJ6WMs")
 
-    assert [step["tool"] for step in steps] == ["browser.open", "video.download_permitted"]
+    assert [step["tool"] for step in steps] == ["video.download_permitted"]
     assert steps[0]["args"]["url"] == "https://www.youtube.com/watch?v=MhUS3zJ6WMs"
-    assert steps[1]["args"]["url"] == "https://www.youtube.com/watch?v=MhUS3zJ6WMs"
+
+
+def test_permitted_public_youtube_link_download_skips_browser_open(tmp_path):
+    service = build_service(tmp_path)
+
+    steps = service._heuristic_plan("Download this permitted public video: https://www.youtube.com/watch?v=i9_lboy-Et0")
+
+    assert [step["tool"] for step in steps] == ["video.download_permitted"]
+    assert steps[0]["args"]["url"] == "https://www.youtube.com/watch?v=i9_lboy-Et0"
+
+
+@pytest.mark.asyncio
+async def test_runtime_plans_downloaded_media_reference_without_phrase_router(tmp_path):
+    service = build_service(tmp_path)
+
+    steps = await service._plan_steps("play that downloaded song in vlc")
+
+    assert [step["tool"] for step in steps] == ["artifact.resolve_reference", "app.open_with_file"]
+    assert steps[0]["args"]["media_types"] == ["audio", "video"]
+    assert steps[1]["args"]["app_name"] == "vlc"
+
+
+def test_artifact_memory_resolves_latest_downloaded_media(tmp_path):
+    service = build_service(tmp_path)
+    run_dir = service._safe_run_download_dir("artifact-memory-test")
+    media_path = run_dir / "Licensed Demo Song.mp4"
+    media_path.write_text("demo", encoding="utf-8")
+
+    artifact = service.artifacts.record_download(media_path, "artifact-memory-test", title="Licensed Demo Song")
+    resolved, matches, reason = service.artifacts.resolve_reference("play that downloaded song in vlc")
+
+    assert resolved is not None
+    assert resolved.id == artifact.id
+    assert matches
+    assert reason == ""
+
+
+@pytest.mark.asyncio
+async def test_artifact_resolve_then_open_with_requested_app(tmp_path):
+    service = build_service(tmp_path)
+    run_dir = service._safe_run_download_dir("open-artifact-test")
+    media_path = run_dir / "Lecture Clip.mp4"
+    media_path.write_text("demo", encoding="utf-8")
+    service.artifacts.record_download(media_path, "open-artifact-test", title="Lecture Clip")
+    run = AutomationRun(id="open-artifact-test", prompt="play that downloaded video in vlc", status="running")
+    service.runs[run.id] = run
+    opened: list[tuple[str, str]] = []
+
+    def fake_open(artifact, app_name):
+        opened.append((artifact.filename, app_name))
+        return {"artifact_id": artifact.id, "filename": artifact.filename, "path": artifact.path, "app": {"app_name": app_name, "path": "vlc.exe", "launch_mode": "executable"}}
+
+    service.runtime.open_artifact_with_app = fake_open  # type: ignore[method-assign]
+
+    await service._tool_artifact_resolve_reference(run, {"query": run.prompt, "media_types": ["video", "audio"]})
+    await service._tool_app_open_with_file(run, {"app_name": "vlc"})
+
+    assert opened == [("Lecture Clip.mp4", "vlc")]
+    assert run.result == "Opened Lecture Clip.mp4 with vlc."
+    assert [event.type for event in run.events[-2:]] == ["artifact_resolved", "app_opened"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_loop_opens_latest_artifact_containing_folder(tmp_path):
+    service = build_service(tmp_path)
+    run_dir = service._safe_run_download_dir("folder-open-test")
+    media_path = run_dir / "Latest Clip.mp4"
+    media_path.write_text("demo", encoding="utf-8")
+    service.artifacts.record_download(media_path, "folder-open-test", title="Latest Clip")
+    opened: list[str] = []
+
+    def fake_open_folder(artifact):
+        opened.append(artifact.filename)
+        return {"artifact_id": artifact.id, "filename": artifact.filename, "path": artifact.path, "folder_path": str(Path(artifact.path).parent)}
+
+    service.runtime.open_artifact_containing_folder = fake_open_folder  # type: ignore[method-assign]
+
+    run = await service.start_run(AutomationRunRequest(prompt="open folder where file is located"))
+    finished = await wait_for_run(service, run.id, {"complete"})
+
+    assert opened == ["Latest Clip.mp4"]
+    assert finished.result == "Opened the folder containing Latest Clip.mp4."
+    assert any(event.type == "folder_opened" for event in finished.events)
+    assert any(event.type == "verified" for event in finished.events)
+
+
+@pytest.mark.asyncio
+async def test_runtime_loop_waits_for_artifact_selection_then_resumes(tmp_path):
+    service = build_service(tmp_path)
+    run_dir = service._safe_run_download_dir("folder-pick-test")
+    first = run_dir / "Demo Clip.mp4"
+    second = run_dir / "Demo Clip.mkv"
+    first.write_text("one", encoding="utf-8")
+    second.write_text("two", encoding="utf-8")
+    first_artifact = service.artifacts.record_download(first, "folder-pick-test", title="Demo Clip")
+    second_artifact = service.artifacts.record_download(second, "folder-pick-test", title="Demo Clip")
+    opened: list[str] = []
+
+    def fake_open_folder(artifact):
+        opened.append(artifact.id)
+        return {"artifact_id": artifact.id, "filename": artifact.filename, "path": artifact.path, "folder_path": str(Path(artifact.path).parent)}
+
+    service.runtime.open_artifact_containing_folder = fake_open_folder  # type: ignore[method-assign]
+
+    run = await service.start_run(AutomationRunRequest(prompt="open folder for demo file"))
+    waiting = await wait_for_run(service, run.id, {"waiting_for_user"})
+
+    assert waiting.agent_state["candidates"]
+    assert opened == []
+
+    await service.continue_run(run.id, AutomationContinueRequest(selected_artifact_id=first_artifact.id, note="use the mp4"))
+    finished = await wait_for_run(service, run.id, {"complete"})
+
+    assert opened == [first_artifact.id]
+    assert finished.agent_state["last_artifact_id"] == first_artifact.id
+    assert second_artifact.id != first_artifact.id
+
+
+@pytest.mark.asyncio
+async def test_continue_without_clarification_does_not_leave_runtime_stuck(tmp_path):
+    service = build_service(tmp_path)
+    run_dir = service._safe_run_download_dir("folder-wait-test")
+    for name in ("Demo Clip.mp4", "Demo Clip.mkv"):
+        path = run_dir / name
+        path.write_text("demo", encoding="utf-8")
+        service.artifacts.record_download(path, "folder-wait-test", title="Demo Clip")
+
+    run = await service.start_run(AutomationRunRequest(prompt="open folder for demo file"))
+    waiting = await wait_for_run(service, run.id, {"waiting_for_user"})
+    assert waiting.status == "waiting_for_user"
+
+    await service.continue_run(run.id, AutomationContinueRequest())
+    still_waiting = await wait_for_run(service, run.id, {"waiting_for_user"})
+
+    assert still_waiting.status == "waiting_for_user"
+    assert still_waiting.agent_state["candidates"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_loop_replans_after_failed_tool_action(tmp_path):
+    service = build_service(tmp_path)
+    run_dir = service._safe_run_download_dir("folder-replan-test")
+    media_path = run_dir / "Retry Clip.mp4"
+    media_path.write_text("demo", encoding="utf-8")
+    service.artifacts.record_download(media_path, "folder-replan-test", title="Retry Clip")
+    calls = 0
+
+    def flaky_open_folder(artifact):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ValueError("Explorer was busy")
+        return {"artifact_id": artifact.id, "filename": artifact.filename, "path": artifact.path, "folder_path": str(Path(artifact.path).parent)}
+
+    service.runtime.open_artifact_containing_folder = flaky_open_folder  # type: ignore[method-assign]
+
+    run = await service.start_run(AutomationRunRequest(prompt="open folder where file is located"))
+    finished = await wait_for_run(service, run.id, {"complete"})
+
+    assert calls == 2
+    assert any(event.type == "replanned" for event in finished.events)
 
 
 def test_alarm_plan_uses_windows_tool_not_google(tmp_path, monkeypatch):
@@ -337,17 +668,12 @@ def test_open_download_path_only_allows_download_folder(tmp_path, monkeypatch):
     assert opened == [str(allowed)]
 
 
-@pytest.mark.asyncio
-async def test_video_confirmation_requires_rights_confirmation(tmp_path):
+def test_video_download_does_not_require_rights_confirmation(tmp_path):
     service = build_service(tmp_path)
-    run = AutomationRun(id="rights-test", prompt="download video", confirmation={"kind": "video_download_permission"})
-    service.runs[run.id] = run
-    future = asyncio.get_running_loop().create_future()
-    service._confirmation_futures[run.id] = future
+    run = AutomationRun(id="rights-test", prompt="download video")
+    step = {"tool": "video.download_permitted", "description": "Download video.", "args": {"url": "https://www.youtube.com/watch?v=abc123"}}
 
-    await service.confirm_run(run.id, AutomationConfirmRequest(approved=True, confirmed_rights=False))
-
-    assert future.result() is False
+    assert service._requires_confirmation(run, step) is False
 
 
 @pytest.mark.asyncio
@@ -388,8 +714,12 @@ async def test_mocked_ytdlp_video_download_completes(tmp_path, monkeypatch):
 
     assert run.result == "Downloaded Licensed Demo [abc123].mp4."
     assert any(event.type == "download_complete" for event in run.events)
+    assert any(event.type == "artifact_recorded" for event in run.events)
     assert any(event.type == "download_progress" and event.data["progress_percent"] == 100 for event in run.events)
     assert all("folder_path" in event.data for event in run.events if event.type.startswith("download_"))
+    artifact = service.artifacts.resolve_reference("latest downloaded video")[0]
+    assert artifact is not None
+    assert artifact.filename == "Licensed Demo [abc123].mp4"
 
 
 @pytest.mark.asyncio
@@ -484,18 +814,14 @@ async def test_destructive_file_run_is_cancelled_with_blocked_event(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_python_step_requires_confirmation_then_completes_and_saves_recipe(tmp_path):
+async def test_python_recipe_builder_saves_executable_recipe_without_running_it(tmp_path):
     service = build_service(tmp_path)
 
     run = await service.start_run(AutomationRunRequest(prompt="create reusable automation with python", create_recipe=True))
-    waiting = await wait_for_run(service, run.id, {"confirmation_required"})
-
-    assert waiting.confirmation is not None
-    assert "Python" in waiting.confirmation["message"]
-
-    await service.confirm_run(run.id, AutomationConfirmRequest(approved=True))
     finished = await wait_for_run(service, run.id, {"complete"})
+    recipe = service.get_recipe(finished.recipe_id)
 
     assert finished.result
-    assert finished.recipe_id
-    assert service.list_recipes()
+    assert recipe is not None
+    assert recipe.status == "executable"
+    assert recipe.steps[0]["tool"] == "python.run_safe"

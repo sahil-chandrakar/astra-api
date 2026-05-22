@@ -5,18 +5,22 @@ from app.models import (
     AgentCommandResponse,
     AgentEvent,
     AppMode,
+    AutomationRun,
+    AutomationRunRequest,
     ChatResponse,
     CommandRequest,
     CommandResponse,
     ResearchDepth,
     ResearchRequest,
     ResearchResponse,
+    AutomationSuggestion,
 )
 from app.services.agents import AstraAgentSystem
 from app.services.desktop import DesktopActionService
 from app.services.reports import ReportService
 from app.services.research import ResearchService
 from app.services.safe_agent import SafeAgentService
+from app.services.automations import AutomationService
 
 
 MODE_ALIASES: dict[str, AppMode] = {
@@ -43,18 +47,24 @@ class CommandService:
         reports: ReportService,
         safe_agent: SafeAgentService,
         research_service: ResearchService | None = None,
+        automation_service: AutomationService | None = None,
     ):
         self.agent_system = agent_system
         self.desktop_actions = desktop_actions
         self.reports = reports
         self.safe_agent = safe_agent
         self.research_service = research_service
+        self.automation_service = automation_service
 
     async def handle(self, request: CommandRequest) -> CommandResponse:
         text = request.text.strip()
         requested_mode = self._detect_mode_switch(text)
         if requested_mode:
             return self._mode_switch_response(requested_mode)
+
+        conversational = self._conversation_response(text, request.mode)
+        if conversational:
+            return conversational
 
         if request.mode == "agents" or self._looks_like_mock_test_intent(text):
             agent_response = await self.safe_agent.handle_natural_language(text, confirmed=request.confirmed)
@@ -69,9 +79,14 @@ class CommandService:
             return await self._research_response(request)
 
         if request.mode == "agents":
-            conversational = self._agent_conversation_response(text)
-            if conversational:
-                return conversational
+            suggestion_handler = getattr(self.automation_service, "automation_suggestion", None) if self.automation_service else None
+            if callable(suggestion_handler):
+                suggestion = suggestion_handler(text)
+                if suggestion:
+                    return self._automation_suggestion_response(suggestion, request.mode)
+            if self.automation_service and self.automation_service.can_handle_agent_prompt(text):
+                run = await self.automation_service.start_run(AutomationRunRequest(prompt=text))
+                return self._automation_response(run)
             plan = self.desktop_actions.plan_message(text)
             if plan:
                 return self._agent_plan_response(plan, request.mode)
@@ -127,13 +142,51 @@ class CommandService:
             agent_command=response,
         )
 
-    def _agent_conversation_response(self, text: str) -> CommandResponse | None:
+    def _automation_response(self, run: AutomationRun) -> CommandResponse:
+        event = AgentEvent(agent="Automation Agent", status="working", message="Started an intelligent automation workflow.")
+        return CommandResponse(
+            mode="sources",
+            intent="agent_plan",
+            suggested_mode="sources",
+            spoken_text="I started the automation workflow.",
+            display_text="Astra is running this through the shared automation runtime.",
+            events=[event],
+            automation_run=run,
+        )
+
+    def _automation_suggestion_response(self, suggestion: AutomationSuggestion, mode: AppMode) -> CommandResponse:
+        recipe = suggestion.recipe
+        input_text = ", ".join(suggestion.inputs) if suggestion.inputs else "No required inputs"
+        message = (
+            f"{suggestion.message}\n"
+            f"Engine: OpenRPA\n"
+            f"Risk: {recipe.risk.replace('_', ' ')}\n"
+            f"Required inputs: {input_text}"
+        )
+        event = AgentEvent(agent="Automation Agent", status="warning", message=f"Suggested OpenRPA workflow: {recipe.name}.")
+        return CommandResponse(
+            mode=mode,
+            intent="automation_suggestion",
+            suggested_mode=mode,
+            spoken_text=f"I found a matching OpenRPA workflow: {recipe.name}. Confirm before running it.",
+            display_text=message,
+            events=[event],
+            automation_suggestion=suggestion,
+        )
+
+    def _conversation_response(self, text: str, mode: AppMode) -> CommandResponse | None:
         normalized = self._normalize(text)
         compact = re.sub(r"[^a-z0-9]+", "", normalized)
         answer = ""
 
         if compact in {"hi", "hii", "hiii", "hello", "helo", "hey", "heyy", "hallo", "yo"} or re.fullmatch(r"(hi+|he+y+|hello+|hlo+)", compact):
             answer = "Hello! I'm Astra. How can I help?"
+        elif compact in {"whatsup", "sup", "wyd"} or re.fullmatch(r"(what'?s\s+up|what\s+is\s+up|sup)\??", normalized):
+            answer = "Not much, just ready to help. What would you like to do?"
+        elif re.search(
+            r"\b(everything|all|systems?)\s+(fine|good|ok|okay|green|working|normal|nominal)\b", normalized
+        ) or re.search(r"\b(are you there|you there|status check|system check)\b", normalized):
+            answer = "All systems green on my end. How can I help?"
         elif re.search(r"\b(what is your name|what's your name|who are you|your name)\b", normalized):
             answer = "My name is Astra. I'm your voice-first AI assistant."
         elif re.search(r"\b(how are you|how r you|how are u)\b", normalized):
@@ -146,7 +199,7 @@ class CommandService:
 
         event = AgentEvent(agent="Astra", status="complete", message="Conversational response ready.")
         return CommandResponse(
-            mode="agents",
+            mode=mode,
             intent="chat",
             spoken_text=answer,
             display_text=answer,

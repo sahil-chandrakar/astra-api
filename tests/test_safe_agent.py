@@ -207,6 +207,25 @@ async def test_open_drive_resolves_and_executes_google_drive_not_google(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_open_calculator_uses_local_target_when_semantic_llm_omits_params(tmp_path):
+    desktop = RecordingDesktopActionService()
+    service, _, _, _, _ = build_service(
+        tmp_path,
+        desktop=desktop,
+        cerebras_api_key="test-key",
+        llm_response='{"command_id":"open_allowlisted_target","intent":"open_allowlisted_target","confidence":0.95,"matched_alias":"calculator","reason":"user wants calculator"}',
+    )
+
+    response = await service.handle_natural_language("open calculator")
+
+    assert response is not None
+    assert response.outcome == "success"
+    assert response.params["target"] == "calculator"
+    assert desktop.executed == ["open Calculator"]
+    assert service.llm.calls == []
+
+
+@pytest.mark.asyncio
 async def test_common_safe_target_typos_resolve_without_llm(tmp_path):
     desktop = RecordingDesktopActionService()
     service, _, _, _, _ = build_service(tmp_path, desktop=desktop)
@@ -923,7 +942,7 @@ async def test_unknown_discrete_math_numerical_uses_llm_batches_and_constraints(
     assert "truth value" not in prompts
     assert all(any(char.isdigit() for char in " ".join([question.prompt, *question.options])) for question in test.questions)
     first_generation_prompt = json.loads(mock_tests.llm.calls[1][1])  # type: ignore[attr-defined]
-    assert first_generation_prompt["candidate_count"] <= 8
+    assert 10 <= first_generation_prompt["candidate_count"] <= 16
     assert first_generation_prompt["constraints"] == ["only numerical questions"]
     assert any("numerical-only" in rule for rule in first_generation_prompt["quality_rules"])
 
@@ -967,6 +986,29 @@ async def test_discrete_math_profile_generates_numerical_questions_without_llm(t
     assert test.quality_score == 1.0
     assert all(any(char.isdigit() for char in " ".join([question.prompt, *question.options])) for question in test.questions)
     assert "mitochondria" not in " ".join(question.prompt.lower() for question in test.questions)
+
+
+@pytest.mark.asyncio
+async def test_cyber_security_profile_generates_hard_numerical_questions_without_llm(tmp_path):
+    _, _, _, _, mock_tests = build_service(tmp_path)
+
+    test, setup = await mock_tests.generate(
+        MockTestGenerateRequest(
+            topic="cyber security numerical questions",
+            constraints=["numerical questions", "toughest exam difficulty"],
+            difficulty="hard",
+            question_count=10,
+        )
+    )
+
+    prompts = " ".join(question.prompt.lower() for question in test.questions)
+    assert setup == []
+    assert test.subject == "Cyber Security"
+    assert test.generation_mode == "profile_based"
+    assert test.quality_score == 1.0
+    assert all(question.difficulty == "hard" for question in test.questions)
+    assert all(any(char.isdigit() for char in " ".join([question.prompt, *question.options])) for question in test.questions)
+    assert "rsa" in prompts or "risk" in prompts
 
 
 @pytest.mark.asyncio

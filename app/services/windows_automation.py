@@ -91,6 +91,168 @@ class WindowsAutomationService:
             {**data, "automation_failed": True},
         )
 
+    def open_app(self, app_name: str) -> WindowsAutomationResult:
+        if not self.is_supported():
+            return self._unsupported(app_name or "Desktop app")
+
+        clean = re.sub(r"\s+", " ", app_name or "").strip()
+        if not clean:
+            return WindowsAutomationResult(False, "windows_error", "Desktop app open step needs an app name.")
+
+        normalized = clean.lower()
+        try:
+            if normalized in {"whatsapp", "whats app", "whatsapp desktop"}:
+                if self._open_windows_app_uri_or_start_app("whatsapp://", "WhatsApp"):
+                    return WindowsAutomationResult(True, "app_opened", "Opened WhatsApp.", {"app": "WhatsApp"})
+                return WindowsAutomationResult(False, "windows_error", "WhatsApp is not installed or could not be opened.", {"app": "WhatsApp"})
+
+            executable = self._resolve_executable(clean)
+            if executable:
+                self._popen([executable])
+                return WindowsAutomationResult(True, "app_opened", f"Opened {clean}.", {"app": clean, "path": executable})
+
+            if self._open_start_menu_app(clean):
+                return WindowsAutomationResult(True, "app_opened", f"Opened {clean}.", {"app": clean})
+        except Exception as exc:
+            return WindowsAutomationResult(False, "windows_error", f"Could not open {clean}: {exc}", {"app": clean})
+
+        return WindowsAutomationResult(False, "windows_error", f"Could not find an installed app named {clean}.", {"app": clean})
+
+    def prepare_whatsapp_message(self, contact: str, message: str) -> WindowsAutomationResult:
+        if not self.is_supported():
+            return self._unsupported("WhatsApp")
+
+        clean_contact = re.sub(r"\s+", " ", contact or "").strip()
+        clean_message = str(message or "").strip()
+        if not clean_contact:
+            return WindowsAutomationResult(False, "windows_error", "WhatsApp automation needs a contact name.", {"app": "WhatsApp"})
+        if not clean_message:
+            return WindowsAutomationResult(False, "windows_error", "WhatsApp automation needs a message.", {"app": "WhatsApp", "contact": clean_contact})
+
+        try:
+            self.open_app("WhatsApp")
+            if not self._focus_window_by_title("WhatsApp", timeout=8):
+                return WindowsAutomationResult(False, "windows_error", "WhatsApp opened, but Astra could not focus its window.", {"app": "WhatsApp", "contact": clean_contact})
+
+            if not self._open_whatsapp_chat(clean_contact):
+                return WindowsAutomationResult(
+                    False,
+                    "windows_error",
+                    f"Could not open a WhatsApp chat for {clean_contact}.",
+                    {"app": "WhatsApp", "contact": clean_contact},
+                )
+
+            message_box_ready = self._focus_whatsapp_message_box()
+            self._send_text_to_active_control(clean_message, replace=False)
+        except Exception as exc:
+            return WindowsAutomationResult(
+                False,
+                "windows_error",
+                f"Could not prepare WhatsApp message for {clean_contact}: {exc}",
+                {"app": "WhatsApp", "contact": clean_contact, "message_length": len(clean_message)},
+            )
+
+        return WindowsAutomationResult(
+            True,
+            "whatsapp_prepared",
+            f"Prepared WhatsApp message to {clean_contact}.",
+            {
+                "app": "WhatsApp",
+                "contact": clean_contact,
+                "message_length": len(clean_message),
+                "message_box_detected": message_box_ready,
+            },
+        )
+
+    def find_text(
+        self,
+        text: str,
+        app_name: str = "",
+        timeout: int = 8,
+        control_types: list[str] | None = None,
+        exclude_control_types: list[str] | None = None,
+    ) -> WindowsAutomationResult:
+        if not self.is_supported():
+            return self._unsupported("Desktop text search")
+        clean = re.sub(r"\s+", " ", text or "").strip()
+        if not clean:
+            return WindowsAutomationResult(False, "windows_error", "Desktop text search needs text to find.")
+        try:
+            target = self._find_text_target(clean, app_name, timeout, control_types or [], exclude_control_types or [])
+        except Exception as exc:
+            return WindowsAutomationResult(False, "windows_error", f"Could not inspect the desktop UI: {exc}", {"text": clean, "app": app_name})
+        if not target:
+            scope = f" in {app_name}" if app_name else ""
+            return WindowsAutomationResult(False, "desktop_text_not_found", f"Could not find '{clean}'{scope}.", {"text": clean, "app": app_name})
+        return WindowsAutomationResult(True, "desktop_text_found", f"Found '{clean}'.", {"text": clean, "app": app_name, "target": target})
+
+    def click_target(self, target: Any = None, text: str = "", button: str = "left") -> WindowsAutomationResult:
+        if not self.is_supported():
+            return self._unsupported("Desktop click")
+
+        try:
+            resolved = target if isinstance(target, dict) else None
+            if not resolved and text:
+                found = self._find_text_target(text, "", 5, [], [])
+                resolved = found
+            if not resolved:
+                return WindowsAutomationResult(False, "windows_error", "Desktop click needs a found target or text.")
+
+            rect = resolved.get("rect") if isinstance(resolved, dict) else None
+            if not isinstance(rect, dict):
+                return WindowsAutomationResult(False, "windows_error", "Desktop click target is missing screen coordinates.", {"target": resolved})
+            x = int((int(rect["left"]) + int(rect["right"])) / 2)
+            y = int((int(rect["top"]) + int(rect["bottom"])) / 2)
+            self._click_screen_point(x, y, button=button if button in {"left", "right"} else "left")
+        except Exception as exc:
+            return WindowsAutomationResult(False, "windows_error", f"Could not click the desktop target: {exc}", {"target": target})
+        return WindowsAutomationResult(True, "desktop_clicked", "Clicked the desktop target.", {"target": resolved})
+
+    def type_text(self, text: str, replace: bool = False) -> WindowsAutomationResult:
+        if not self.is_supported():
+            return self._unsupported("Desktop typing")
+        clean = str(text or "")
+        if not clean:
+            return WindowsAutomationResult(False, "windows_error", "Desktop typing needs text.")
+        try:
+            from pywinauto.keyboard import send_keys
+
+            if replace:
+                send_keys("^a{BACKSPACE}", pause=0.02)
+            send_keys(self._send_keys_literal(clean), pause=0.02, with_spaces=True)
+        except Exception as exc:
+            return WindowsAutomationResult(False, "windows_error", f"Could not type into the active desktop control: {exc}", {"text_length": len(clean)})
+        return WindowsAutomationResult(True, "desktop_typed", "Typed text into the focused desktop control.", {"text_length": len(clean), "replace": replace})
+
+    def press_key(self, key: str) -> WindowsAutomationResult:
+        if not self.is_supported():
+            return self._unsupported("Desktop key press")
+        normalized = (key or "").strip().lower()
+        key_map = {
+            "enter": "{ENTER}",
+            "tab": "{TAB}",
+            "escape": "{ESC}",
+            "backspace": "{BACKSPACE}",
+            "delete": "{DELETE}",
+            "space": "{SPACE}",
+        }
+        keys = key_map.get(normalized)
+        if not keys:
+            return WindowsAutomationResult(False, "windows_error", f"Desktop key is not allowed: {key}.", {"key": key})
+        try:
+            from pywinauto.keyboard import send_keys
+
+            send_keys(keys, pause=0.03)
+        except Exception as exc:
+            return WindowsAutomationResult(False, "windows_error", f"Could not press {normalized}: {exc}", {"key": normalized})
+        return WindowsAutomationResult(True, "desktop_key_pressed", f"Pressed {normalized}.", {"key": normalized})
+
+    def verify_text(self, text: str, app_name: str = "", timeout: int = 6) -> WindowsAutomationResult:
+        result = self.find_text(text, app_name=app_name, timeout=timeout)
+        if result.ok:
+            return WindowsAutomationResult(True, "desktop_verified", f"Verified '{text}' is visible.", result.data)
+        return WindowsAutomationResult(False, "desktop_verify_failed", f"Could not verify '{text}' is visible.", result.data)
+
     def resolve_file_explorer_target(self, target: str = "") -> Path:
         normalized = re.sub(r"\s+", " ", target.lower()).strip()
         home = Path.home()
@@ -157,6 +319,278 @@ class WindowsAutomationService:
             stderr=subprocess.DEVNULL,
             creationflags=creation_flags,
         )
+
+    def _resolve_executable(self, app_name: str) -> str:
+        import shutil
+
+        candidates = [app_name]
+        if not app_name.lower().endswith(".exe"):
+            candidates.append(f"{app_name}.exe")
+        aliases = {
+            "vlc": ["vlc.exe"],
+            "notepad": ["notepad.exe"],
+            "calculator": ["calc.exe"],
+            "calc": ["calc.exe"],
+        }
+        candidates.extend(aliases.get(app_name.lower(), []))
+        for candidate in dict.fromkeys(candidates):
+            if path := shutil.which(candidate):
+                return path
+        return ""
+
+    def _open_windows_app_uri_or_start_app(self, uri: str, app_name: str) -> bool:
+        try:
+            self._open_uri(uri)
+            time.sleep(1.2)
+            if self._window_title_visible(app_name, timeout=5):
+                return True
+            # URI launch success is the best signal Windows gives us for Store apps.
+            # A later desktop.find_text step performs the real UI verification.
+            return True
+        except Exception:
+            pass
+        return self._open_start_menu_app(app_name)
+
+    def _open_start_menu_app(self, app_name: str) -> bool:
+        app_id = self._start_app_id(app_name)
+        if not app_id:
+            return False
+        self._popen(["explorer.exe", f"shell:AppsFolder\\{app_id}"])
+        time.sleep(1.2)
+        return self._window_title_visible(app_name, timeout=6)
+
+    def _start_app_id(self, app_name: str) -> str:
+        try:
+            command = (
+                "$name = "
+                + repr(f"*{app_name}*")
+                + "; (Get-StartApps | Where-Object { $_.Name -like $name } | Select-Object -First 1 -ExpandProperty AppID)"
+            )
+            completed = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                creationflags=subprocess.CREATE_NO_WINDOW if self.is_supported() else 0,
+            )
+            return (completed.stdout or "").strip().splitlines()[0].strip()
+        except Exception:
+            return ""
+
+    def _window_title_visible(self, title_fragment: str, timeout: float = 4) -> bool:
+        fragment = re.sub(r"\s+", " ", title_fragment or "").strip().lower()
+        if not fragment:
+            return False
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                from pywinauto import Desktop
+
+                desktop = Desktop(backend="uia")
+                for window in desktop.windows():
+                    title = (window.window_text() or "").lower()
+                    if fragment in title or title in fragment:
+                        return True
+            except Exception:
+                return False
+            time.sleep(0.25)
+        return False
+
+    def _focus_window_by_title(self, title_fragment: str, timeout: float = 4) -> bool:
+        fragment = re.sub(r"\s+", " ", title_fragment or "").strip().lower()
+        if not fragment:
+            return False
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                from pywinauto import Desktop
+
+                desktop = Desktop(backend="uia")
+                for window in desktop.windows():
+                    title = (window.window_text() or "").lower()
+                    if fragment not in title and title not in fragment:
+                        continue
+                    try:
+                        window.set_focus()
+                    except Exception:
+                        hwnd = getattr(getattr(window, "element_info", None), "handle", None)
+                        if hwnd:
+                            self._focus_window(int(hwnd))
+                    time.sleep(0.25)
+                    return True
+            except Exception:
+                return False
+            time.sleep(0.25)
+        return False
+
+    def _open_whatsapp_chat(self, contact: str) -> bool:
+        if self._search_whatsapp_contact(contact, hotkey="f"):
+            return True
+        self._focus_window_by_title("WhatsApp", timeout=2)
+        return self._search_whatsapp_contact(contact, hotkey="n")
+
+    def _search_whatsapp_contact(self, contact: str, hotkey: str) -> bool:
+        try:
+            from pywinauto.keyboard import send_keys
+
+            if hotkey == "f" and self._focus_whatsapp_search_box():
+                pass
+            else:
+                send_keys(f"^{hotkey}", pause=0.04)
+                time.sleep(0.45)
+            send_keys("^a{BACKSPACE}" + self._send_keys_literal(contact), pause=0.03, with_spaces=True)
+            time.sleep(0.9)
+            send_keys("{ENTER}", pause=0.05)
+            time.sleep(0.9)
+            return self._focus_whatsapp_message_box()
+        except Exception:
+            return False
+
+    def _focus_whatsapp_search_box(self) -> bool:
+        labels = (
+            "Search or start a new chat",
+            "Search or start new chat",
+            "Search",
+            "Search input textbox",
+        )
+        for label in labels:
+            try:
+                target = self._find_text_target(label, "WhatsApp", 2, ["edit", "text"], [])
+            except Exception:
+                target = None
+            if self._click_desktop_target(target):
+                time.sleep(0.2)
+                return True
+        return False
+
+    def _focus_whatsapp_message_box(self) -> bool:
+        labels = (
+            "Type a message",
+            "Message",
+            "Type a message here",
+        )
+        for label in labels:
+            try:
+                target = self._find_text_target(label, "WhatsApp", 2, ["edit", "text"], [])
+            except Exception:
+                target = None
+            if self._click_desktop_target(target):
+                time.sleep(0.2)
+                return True
+        return False
+
+    def _send_text_to_active_control(self, text: str, replace: bool = False) -> None:
+        from pywinauto.keyboard import send_keys
+
+        prefix = "^a{BACKSPACE}" if replace else ""
+        send_keys(prefix + self._send_keys_literal(text), pause=0.02, with_spaces=True)
+
+    def _click_desktop_target(self, target: Any) -> bool:
+        if not isinstance(target, dict):
+            return False
+        rect = target.get("rect")
+        if not isinstance(rect, dict):
+            return False
+        try:
+            x = int((int(rect["left"]) + int(rect["right"])) / 2)
+            y = int((int(rect["top"]) + int(rect["bottom"])) / 2)
+            self._click_screen_point(x, y)
+            return True
+        except Exception:
+            return False
+
+    def _find_text_target(
+        self,
+        text: str,
+        app_name: str,
+        timeout: int,
+        control_types: list[str],
+        exclude_control_types: list[str],
+    ) -> dict[str, Any] | None:
+        from pywinauto import Desktop
+
+        target_text = text.lower()
+        included = {item.lower() for item in control_types if item}
+        excluded = {item.lower() for item in exclude_control_types if item}
+        desktop = Desktop(backend="uia")
+        deadline = time.monotonic() + max(1, timeout)
+        while time.monotonic() < deadline:
+            for window in self._candidate_windows(desktop, app_name):
+                match = self._find_text_in_window(window, target_text, included, excluded)
+                if match:
+                    return match
+            time.sleep(0.25)
+        return None
+
+    def _candidate_windows(self, desktop: Any, app_name: str) -> list[Any]:
+        try:
+            windows = list(desktop.windows())
+        except Exception:
+            return []
+        clean_app = re.sub(r"\s+", " ", app_name or "").strip().lower()
+        visible = []
+        for window in windows:
+            try:
+                if not window.is_visible():
+                    continue
+                visible.append(window)
+            except Exception:
+                continue
+        if not clean_app:
+            return visible
+        matches = [window for window in visible if clean_app in ((window.window_text() or "").lower())]
+        return matches or visible
+
+    def _find_text_in_window(
+        self,
+        window: Any,
+        target_text: str,
+        control_types: set[str],
+        exclude_control_types: set[str],
+    ) -> dict[str, Any] | None:
+        controls = [window]
+        try:
+            controls.extend(window.descendants())
+        except Exception:
+            pass
+        for control in controls:
+            try:
+                control_text = re.sub(r"\s+", " ", control.window_text() or "").strip()
+                if not control_text or target_text not in control_text.lower():
+                    continue
+                control_type = str(getattr(control.element_info, "control_type", "") or "")
+                control_type_key = control_type.lower()
+                if control_types and control_type_key not in control_types:
+                    continue
+                if exclude_control_types and control_type_key in exclude_control_types:
+                    continue
+                rect = control.rectangle()
+                if rect.width() <= 0 or rect.height() <= 0:
+                    continue
+                return {
+                    "text": control_text,
+                    "control_type": control_type,
+                    "window_title": window.window_text() or "",
+                    "rect": {"left": rect.left, "top": rect.top, "right": rect.right, "bottom": rect.bottom},
+                }
+            except Exception:
+                continue
+        return None
+
+    def _send_keys_literal(self, text: str) -> str:
+        replacements = {
+            "{": "{{}",
+            "}": "{}}",
+            "+": "{+}",
+            "^": "{^}",
+            "%": "{%}",
+            "~": "{~}",
+            "(": "{(}",
+            ")": "{)}",
+            "[": "{[}",
+            "]": "{]}",
+        }
+        return "".join(replacements.get(char, char) for char in text)
 
     def _send_keys_to_active_window(self, keys: str) -> bool:
         try:
@@ -581,14 +1015,16 @@ class WindowsAutomationService:
         except Exception:
             return None
 
-    def _click_screen_point(self, x: int, y: int) -> None:
+    def _click_screen_point(self, x: int, y: int, button: str = "left") -> None:
         import ctypes
 
         user32 = ctypes.windll.user32
+        down = 0x0008 if button == "right" else 0x0002
+        up = 0x0010 if button == "right" else 0x0004
         user32.SetCursorPos(x, y)
-        user32.mouse_event(0x0002, 0, 0, 0, 0)
+        user32.mouse_event(down, 0, 0, 0, 0)
         time.sleep(0.04)
-        user32.mouse_event(0x0004, 0, 0, 0, 0)
+        user32.mouse_event(up, 0, 0, 0, 0)
 
     def _wait_for_alarm_save_button(self, clock: Any, timeout: float) -> Any | None:
         deadline = time.monotonic() + timeout

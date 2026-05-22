@@ -1,11 +1,13 @@
+import asyncio
+
 import pytest
 
 from app.config import Settings
-from app.models import ChatResponse, CommandRequest, LlmProfileConfig, LlmSettingsUpdateRequest, ResearchRequest
+from app.models import AutomationRun, ChatResponse, CommandRequest, LlmProfileConfig, LlmSettingsUpdateRequest, ResearchRequest
 from app.services.agents import AstraAgentSystem
 from app.services.commands import CommandService
 from app.services.desktop import DesktopActionService
-from app.services.llm import LlmService
+from app.services.llm import NVIDIA_FAST_MODELS, NVIDIA_FREE_CHAT_MODEL_IDS, NVIDIA_PRO_MODELS, LlmService
 
 
 class RecordingLlm:
@@ -22,6 +24,21 @@ class RecordingLlm:
         return self.answer, []
 
 
+class SlowProFallbackLlm:
+    def __init__(self):
+        self.models: list[str | None] = []
+
+    def model_for_profile(self, profile: str) -> str:
+        return "nvidia:slow-pro" if profile == "pro" else "cerebras:fast-model"
+
+    async def complete(self, _system_prompt: str, _user_prompt: str, model: str | None = None):
+        self.models.append(model)
+        if model == "nvidia:slow-pro":
+            await asyncio.sleep(1)
+            return "slow", []
+        return "fast fallback", []
+
+
 class EmptySearch:
     async def search_web(self, query: str, max_results: int = 5):
         return [], []
@@ -33,6 +50,18 @@ class EmptySearch:
 class EmptySafeAgent:
     async def handle_natural_language(self, text: str, confirmed: bool = False):
         return None
+
+
+class FakeAutomationService:
+    def __init__(self):
+        self.prompts: list[str] = []
+
+    def can_handle_agent_prompt(self, prompt: str) -> bool:
+        return "downloaded" in prompt.lower()
+
+    async def start_run(self, request):
+        self.prompts.append(request.prompt)
+        return AutomationRun(id="automation-test", prompt=request.prompt)
 
 
 def build_command_service(tmp_path):
@@ -74,6 +103,63 @@ def test_llm_settings_restrict_cerebras_models_by_profile(tmp_path):
     assert response.profiles["pro"].model == "zai-glm-4.7"
 
 
+def test_llm_settings_restrict_nvidia_to_free_chat_models(tmp_path):
+    settings = Settings(
+        data_dir=str(tmp_path / "data"),
+        reports_dir=str(tmp_path / "reports"),
+        piper_cache_dir=str(tmp_path / "piper"),
+        nvidia_model="moonshotai/kimi-k2.6",
+    )
+    llm = LlmService(settings)
+
+    nvidia = next(provider for provider in llm.provider_statuses() if provider.id == "nvidia")
+
+    assert set(nvidia.models) == NVIDIA_FREE_CHAT_MODEL_IDS
+    assert "deepseek-ai/deepseek-v4-flash" not in nvidia.models
+    assert "z-ai/glm5.1" not in nvidia.models
+    assert "moonshotai/kimi-k2.6" not in nvidia.models
+
+
+def test_llm_settings_restrict_nvidia_models_by_profile(tmp_path):
+    settings = Settings(
+        data_dir=str(tmp_path / "data"),
+        reports_dir=str(tmp_path / "reports"),
+        piper_cache_dir=str(tmp_path / "piper"),
+    )
+    llm = LlmService(settings)
+
+    response = llm.update_settings(
+        LlmSettingsUpdateRequest(
+            profiles={
+                "fast": LlmProfileConfig(provider="nvidia", model=NVIDIA_PRO_MODELS[0]),
+                "pro": LlmProfileConfig(provider="nvidia", model=NVIDIA_FAST_MODELS[0]),
+            }
+        )
+    )
+
+    assert response.profiles["fast"].model == NVIDIA_FAST_MODELS[0]
+    assert response.profiles["pro"].model == NVIDIA_PRO_MODELS[0]
+
+
+def test_llm_settings_migrates_removed_nvidia_model_to_valid_nvidia_default(tmp_path):
+    settings = Settings(
+        data_dir=str(tmp_path / "data"),
+        reports_dir=str(tmp_path / "reports"),
+        piper_cache_dir=str(tmp_path / "piper"),
+    )
+    llm = LlmService(settings)
+    llm.llm_settings_path.parent.mkdir(parents=True, exist_ok=True)
+    llm.llm_settings_path.write_text(
+        '{"profiles":{"pro":{"provider":"nvidia","model":"mistralai/mistral-large-3-675b-instruct-2512"}}}',
+        encoding="utf-8",
+    )
+
+    profiles = llm.current_profiles()
+
+    assert profiles["pro"].provider == "nvidia"
+    assert profiles["pro"].model == NVIDIA_PRO_MODELS[0]
+
+
 @pytest.mark.asyncio
 async def test_cockpit_command_uses_fast_model_by_default(tmp_path):
     service, _, recorder = build_command_service(tmp_path)
@@ -81,6 +167,30 @@ async def test_cockpit_command_uses_fast_model_by_default(tmp_path):
     await service.handle(CommandRequest(text="summarize my DBMS notes", mode="cockpit", astra_pro=False))
 
     assert recorder.models == ["fast-model"]
+
+
+@pytest.mark.asyncio
+async def test_cockpit_greeting_returns_without_llm_call(tmp_path):
+    service, _, recorder = build_command_service(tmp_path)
+
+    response = await service.handle(CommandRequest(text="hiii", mode="cockpit", astra_pro=False))
+
+    assert response.intent == "chat"
+    assert response.mode == "cockpit"
+    assert response.display_text == "Hello! I'm Astra. How can I help?"
+    assert recorder.models == []
+
+
+@pytest.mark.asyncio
+async def test_cockpit_status_check_returns_without_llm_call(tmp_path):
+    service, _, recorder = build_command_service(tmp_path)
+
+    response = await service.handle(CommandRequest(text="everything fine ?", mode="cockpit", astra_pro=True))
+
+    assert response.intent == "chat"
+    assert response.mode == "cockpit"
+    assert response.display_text == "All systems green on my end. How can I help?"
+    assert recorder.models == []
 
 
 @pytest.mark.asyncio
@@ -111,6 +221,29 @@ async def test_agent_mode_greeting_is_plain_chat_without_intent_plan(tmp_path):
     assert response.display_text == "Hello! I'm Astra. How can I help?"
     assert "Intent:" not in response.display_text
     assert "Plan:" not in response.display_text
+    assert recorder.models == []
+
+
+@pytest.mark.asyncio
+async def test_agent_mode_delegates_artifact_task_to_automation_runtime(tmp_path):
+    settings = Settings(
+        data_dir=str(tmp_path / "data"),
+        reports_dir=str(tmp_path / "reports"),
+        piper_cache_dir=str(tmp_path / "piper"),
+    )
+    agent_system = AstraAgentSystem(settings)
+    recorder = RecordingLlm()
+    agent_system.llm = recorder  # type: ignore[assignment]
+    automation = FakeAutomationService()
+    service = CommandService(agent_system, DesktopActionService(), object(), EmptySafeAgent(), automation_service=automation)  # type: ignore[arg-type]
+
+    response = await service.handle(CommandRequest(text="play that downloaded song in vlc", mode="agents", astra_pro=False))
+
+    assert response.intent == "agent_plan"
+    assert response.suggested_mode == "sources"
+    assert response.automation_run is not None
+    assert response.automation_run.id == "automation-test"
+    assert automation.prompts == ["play that downloaded song in vlc"]
     assert recorder.models == []
 
 
@@ -156,6 +289,26 @@ async def test_direct_chat_request_can_select_fast_or_pro(tmp_path):
     assert fast.answer == "ok"
     assert pro.answer == "ok"
     assert recorder.models == ["fast-model", "pro-model"]
+
+
+@pytest.mark.asyncio
+async def test_cockpit_pro_chat_falls_back_when_selected_model_times_out(tmp_path, monkeypatch):
+    monkeypatch.setattr("app.services.agents.CHAT_LLM_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr("app.services.agents.CHAT_LLM_FALLBACK_TIMEOUT_SECONDS", 0.2)
+    settings = Settings(
+        data_dir=str(tmp_path / "data"),
+        reports_dir=str(tmp_path / "reports"),
+        piper_cache_dir=str(tmp_path / "piper"),
+    )
+    agent_system = AstraAgentSystem(settings)
+    recorder = SlowProFallbackLlm()
+    agent_system.llm = recorder  # type: ignore[assignment]
+
+    response = await agent_system.chat("explain one thing", "cockpit", astra_pro=True)
+
+    assert response.answer == "fast fallback"
+    assert response.setup_required == ["LLM_PRO_TIMEOUT_FALLBACK"]
+    assert recorder.models == ["nvidia:slow-pro", "cerebras:fast-model"]
 
 
 @pytest.mark.asyncio

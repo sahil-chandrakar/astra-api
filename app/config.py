@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     cerebras_pro_model: str = ""
     nvidia_api_key: str = ""
     nvidia_base_url: str = "https://integrate.api.nvidia.com/v1"
-    nvidia_model: str = "moonshotai/kimi-k2.6"
+    nvidia_model: str = "qwen/qwen3-coder-480b-a35b-instruct"
     voice_provider: str = "piper"
     piper_voice_id: str = "en_US-lessac-high"
     piper_cache_dir: str = ".cache/piper"
@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     piper_volume: float = 0.95
     reports_dir: str = "reports"
     data_dir: str = "data"
+    astra_openrpa_exe: str = ""
 
     model_config = SettingsConfigDict(
         env_file=str(BACKEND_ROOT / ".env"),

@@ -17,13 +17,20 @@ from app.models import (
     AutomationCancelRequest,
     AutomationConfirmRequest,
     AutomationContinueRequest,
+    AutomationEngineStatus,
     AutomationEvent,
+    AutomationArtifact,
     AutomationRecipe,
     AutomationRecipeCreateRequest,
     AutomationRun,
     AutomationRunRequest,
+    AutomationSuggestion,
 )
 from app.services.llm import LlmService
+from app.services.agent_runtime import AgentRuntime
+from app.services.artifacts import ArtifactService
+from app.services.automation_builder import AutomationBuilderService, FUTURE_DESKTOP_TOOLS
+from app.services.openrpa import OpenRPAAdapter, OpenRPACancelledError, OpenRPAMissingError
 from app.services.windows_automation import WindowsAutomationResult, WindowsAutomationService
 
 
@@ -39,13 +46,33 @@ ALLOWED_AUTOMATION_TOOLS = {
     "browser.extract",
     "browser.wait_for_user",
     "browser.download",
+    "artifact.resolve_reference",
+    "artifact.list_recent",
+    "artifact.pick",
+    "artifact.open_containing_folder",
+    "file.search_scoped",
+    "file.open",
+    "app.resolve",
+    "app.open",
+    "app.open_with_file",
+    "desktop.find_text",
+    "desktop.click",
+    "desktop.type_text",
+    "desktop.press_key",
+    "desktop.verify_text",
     "python.run_safe",
+    "automation.run_python_safe",
+    "video.download",
     "video.download_permitted",
+    "system.ask_user",
     "windows.set_alarm",
     "windows.open_calculator",
     "windows.open_file_explorer",
+    "windows.prepare_whatsapp_message",
     "windows.reject_destructive_file_action",
     "automation.save_recipe",
+    "task.finish",
+    "task.replan",
 }
 
 PRIVATE_HOSTS = ("mail.google.com", "gmail.com", "accounts.google.com")
@@ -70,6 +97,11 @@ BLOCKED_PROMPT_PATTERN = re.compile(
     r"\b(password|credit card|payment|purchase|buy|delete all|format|wipe|steal|token|cookie|drm|bypass|pirated|torrent|hack)\b",
     re.IGNORECASE,
 )
+OPENRPA_UNSAFE_METADATA_PATTERN = re.compile(
+    r"\b(password|passcode|token|secret|credential|login|sign\s*in|credit\s*card|card\s*number|cvv|payment|pay|purchase|buy|checkout|"
+    r"delete|remove|erase|format|wipe|empty\s+recycle\s+bin|destructive|steal|cookie|session)\b",
+    re.IGNORECASE,
+)
 PYTHON_BLOCKED_PATTERN = re.compile(
     r"\b(import\s+os|from\s+os|subprocess|shutil|socket|requests|urllib|pathlib|yt[-_]?dlp|youtube[-_]?dl|pytube|streamlink|ffmpeg|pip\s+install|curl|wget|open\s*\(\s*['\"][/A-Za-z]:|open\s*\(\s*['\"].*\.\.)\b",
     re.IGNORECASE,
@@ -80,13 +112,22 @@ WINDOWS_DESTRUCTIVE_FILE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 CALCULATOR_EXPRESSION_PATTERN = re.compile(r"^[0-9+\-*/().%\s]+$")
+AUTOMATION_LLM_PROFILE = "pro"
+MAX_RUNTIME_LOOP_STEPS = 8
 
 
 class AutomationService:
-    def __init__(self, settings: Settings, llm: LlmService):
+    def __init__(
+        self,
+        settings: Settings,
+        llm: LlmService,
+        artifact_service: ArtifactService | None = None,
+        runtime: AgentRuntime | None = None,
+    ):
         self.settings = settings
         self.llm = llm
         self.windows = WindowsAutomationService()
+        self.openrpa = OpenRPAAdapter(settings)
 
         base = Path(settings.data_dir)
         if not base.is_absolute():
@@ -106,19 +147,30 @@ class AutomationService:
         self._cancel_events: dict[str, threading.Event] = {}
         self._active_download_processes: dict[str, subprocess.Popen[str]] = {}
         self._download_process_lock = threading.Lock()
+        self._run_tasks: dict[str, asyncio.Task[Any]] = {}
         self._browser_lock = asyncio.Lock()
         self._playwright: Any = None
         self._browser_context: Any = None
         self._page: Any = None
+        self.artifacts = artifact_service or ArtifactService(settings)
+        self.runtime = runtime or AgentRuntime(settings, llm, self.artifacts)
+        self.builder = AutomationBuilderService(self.runtime.registry, ALLOWED_AUTOMATION_TOOLS)
+        self._runtime_context: dict[str, dict[str, Any]] = {}
 
     async def start_run(self, request: AutomationRunRequest) -> AutomationRun:
         recipe = self.get_recipe(request.recipe_id) if request.recipe_id else None
         prompt = recipe.prompt if recipe and not request.prompt.strip() else request.prompt.strip()
-        run = AutomationRun(id=uuid.uuid4().hex, prompt=prompt, recipe_id=recipe.id if recipe else request.recipe_id, create_recipe=request.create_recipe)
+        run = AutomationRun(
+            id=uuid.uuid4().hex,
+            prompt=prompt,
+            recipe_id=recipe.id if recipe else request.recipe_id,
+            create_recipe=request.create_recipe,
+            agent_state={"goal": prompt, "step_count": 0, "failure_history": [], "inputs": dict(request.inputs or {})},
+        )
         self.runs[run.id] = run
         self._append_event(run, "queued", "Automation run queued.", {"prompt": run.prompt})
         self._save_run(run)
-        asyncio.create_task(self._execute_run(run.id, recipe))
+        self._run_tasks[run.id] = asyncio.create_task(self._execute_run(run.id, recipe))
         return run
 
     def get_run(self, run_id: str) -> AutomationRun | None:
@@ -153,11 +205,30 @@ class AutomationService:
         run = self.get_run(run_id)
         if not run:
             return None
+        state = self._runtime_context_for(run)
+        note = request.note.strip()
+        if self._useful_continue_note(note):
+            state["pending_input"] = note
+        elif "pending_input" in state:
+            state.pop("pending_input", None)
+        if request.selected_artifact_id:
+            state["selected_artifact_id"] = request.selected_artifact_id.strip()
+        self._sync_runtime_context_to_run(run)
+
         event = self._continue_events.get(run_id)
         if event:
             event.set()
-        self._set_status(run, "running")
-        self._append_event(run, "continue", request.note or "User confirmed they are ready to continue.")
+            self._set_status(run, "running")
+            self._append_event(run, "continue", note or "User confirmed they are ready to continue.")
+            self._save_run(run)
+            return run
+
+        if run.status == "waiting_for_user":
+            self._set_status(run, "running")
+            self._append_event(run, "continue", note or "Retrying with the current artifact context.", {"selected_artifact_id": request.selected_artifact_id or ""})
+            self._run_tasks[run.id] = asyncio.create_task(self._execute_run(run.id, None, resume=True))
+        else:
+            self._append_event(run, "continue", note or "User confirmed they are ready to continue.")
         self._save_run(run)
         return run
 
@@ -197,12 +268,8 @@ class AutomationService:
         if not run:
             return None
         future = self._confirmation_futures.get(run_id)
-        kind = run.confirmation.get("kind") if isinstance(run.confirmation, dict) else None
         accepted = request.approved
         message = "Approved." if request.approved else "Cancelled by user."
-        if kind == "video_download_permission" and request.approved:
-            accepted = request.confirmed_rights
-            message = "Approved with rights confirmation." if accepted else "Video download permission was not confirmed."
         if future and not future.done():
             future.set_result(accepted)
         self._append_event(
@@ -217,6 +284,18 @@ class AutomationService:
     def list_recipes(self) -> list[AutomationRecipe]:
         return sorted(self._read_recipes(), key=lambda item: item.updated_at, reverse=True)
 
+    def engine_statuses(self) -> list[AutomationEngineStatus]:
+        return [
+            AutomationEngineStatus(
+                id="astra",
+                label="Astra Runtime",
+                installed=True,
+                configured_path="",
+                message="Astra's built-in browser, artifact, and desktop runtime is available.",
+            ),
+            self.openrpa.status(),
+        ]
+
     def get_recipe(self, recipe_id: str | None) -> AutomationRecipe | None:
         if not recipe_id:
             return None
@@ -224,10 +303,119 @@ class AutomationService:
 
     def create_recipe(self, request: AutomationRecipeCreateRequest) -> AutomationRecipe:
         recipes = [recipe for recipe in self._read_recipes() if recipe.name.strip().lower() != request.name.strip().lower()]
-        recipe = AutomationRecipe(id=uuid.uuid4().hex, name=request.name.strip(), prompt=request.prompt.strip(), steps=self._sanitize_steps(request.steps))
+        if request.engine == "openrpa":
+            recipe = self._create_openrpa_recipe(request)
+            recipes.append(recipe)
+            self._write_recipes(recipes)
+            return recipe
+
+        status = request.status
+        steps = self._sanitize_steps(request.steps) if status == "executable" else self._sanitize_recipe_draft_steps(request.steps)
+        if status == "executable" and len(steps) != len([step for step in request.steps if isinstance(step, dict)]):
+            status = "draft"
+        recipe = AutomationRecipe(
+            id=uuid.uuid4().hex,
+            name=request.name.strip(),
+            prompt=request.prompt.strip(),
+            engine="astra",
+            steps=steps,
+            inputs=self._dedupe_strings(request.inputs, limit=12),
+            risk=request.risk,
+            status=status,
+            missing_tools=self._dedupe_strings(request.missing_tools, limit=24),
+            validation_errors=self._dedupe_strings(request.validation_errors, limit=24),
+            built_from=request.built_from.strip()[:500],
+            aliases=self._dedupe_strings(request.aliases, limit=20),
+            description=request.description.strip()[:1000],
+        )
         recipes.append(recipe)
         self._write_recipes(recipes)
         return recipe
+
+    def automation_suggestion(self, prompt: str) -> AutomationSuggestion | None:
+        recipe = self.match_openrpa_recipe(prompt)
+        if not recipe:
+            return None
+        return AutomationSuggestion(
+            recipe=recipe,
+            message=f"Matched registered OpenRPA workflow: {recipe.name}. Review it before running.",
+            inputs=list(recipe.inputs),
+            risk=recipe.risk,
+        )
+
+    def match_openrpa_recipe(self, prompt: str) -> AutomationRecipe | None:
+        normalized = self._normalize_prompt(prompt)
+        candidates: list[tuple[int, AutomationRecipe]] = []
+        for recipe in self._read_recipes():
+            if recipe.engine != "openrpa" or recipe.status != "executable" or recipe.risk == "blocked":
+                continue
+            aliases = [recipe.name, *recipe.aliases]
+            score = 0
+            for alias in aliases:
+                alias_score = self._openrpa_alias_score(normalized, alias)
+                score = max(score, alias_score)
+            if score > 0:
+                candidates.append((score, recipe))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: (item[0], item[1].updated_at), reverse=True)
+        return candidates[0][1]
+
+    def _create_openrpa_recipe(self, request: AutomationRecipeCreateRequest) -> AutomationRecipe:
+        workflow_ref = request.workflow_ref.strip()
+        aliases = self._dedupe_strings(request.aliases, limit=20)
+        inputs = self._dedupe_strings(request.inputs, limit=12)
+        timeout_seconds = min(86400, max(1, int(request.timeout_seconds or 300)))
+        recipe = AutomationRecipe(
+            id=uuid.uuid4().hex,
+            name=request.name.strip(),
+            prompt=request.prompt.strip(),
+            engine="openrpa",
+            steps=[],
+            inputs=inputs,
+            risk=request.risk,
+            status=request.status if request.status == "executable" else "executable",
+            missing_tools=[],
+            validation_errors=[],
+            built_from=request.built_from.strip()[:500],
+            workflow_ref=workflow_ref,
+            workflow_ref_type=request.workflow_ref_type,
+            aliases=aliases,
+            timeout_seconds=timeout_seconds,
+            description=request.description.strip()[:1000],
+        )
+        self._assert_openrpa_recipe_allowed(recipe)
+        self.openrpa.validate_recipe(recipe)
+        return recipe
+
+    def _openrpa_alias_score(self, normalized_prompt: str, alias: str) -> int:
+        normalized_alias = self._normalize_prompt(alias)
+        if len(normalized_alias) < 3:
+            return 0
+        if normalized_alias in normalized_prompt:
+            return 100 + len(normalized_alias)
+        tokens = [token for token in re.split(r"[^a-z0-9]+", normalized_alias) if len(token) >= 3]
+        if tokens and all(re.search(rf"\b{re.escape(token)}\b", normalized_prompt) for token in tokens):
+            return 50 + len(tokens)
+        return 0
+
+    def _assert_openrpa_recipe_allowed(self, recipe: AutomationRecipe) -> None:
+        if recipe.risk == "blocked":
+            raise ValueError("This OpenRPA workflow is marked blocked and cannot be executed.")
+        fields = [
+            recipe.name,
+            recipe.prompt,
+            recipe.workflow_ref,
+            recipe.description,
+            *recipe.aliases,
+            *recipe.inputs,
+        ]
+        joined = " ".join(str(item or "") for item in fields)
+        if OPENRPA_UNSAFE_METADATA_PATTERN.search(joined):
+            raise ValueError(
+                "This OpenRPA workflow is blocked by Astra's safety policy. "
+                "Do not register external workflows for credentials, payments, purchases, or destructive file actions."
+            )
 
     def delete_recipe(self, recipe_id: str) -> bool:
         recipes = self._read_recipes()
@@ -257,12 +445,38 @@ class AutomationService:
         except Exception:
             return False
 
-    async def _execute_run(self, run_id: str, recipe: AutomationRecipe | None = None) -> None:
+    def can_handle_agent_prompt(self, prompt: str) -> bool:
+        normalized = self._normalize_prompt(prompt)
+        if self.runtime.local_plan(prompt):
+            return True
+        if self._should_use_stable_plan(prompt):
+            return True
+        if re.search(r"\b(download|open|play|watch|listen|summari[sz]e|extract|search|find|browse)\b", normalized):
+            return bool(self._extract_url(prompt) or self.artifacts.list_recent(limit=1))
+        return False
+
+    async def _execute_run(self, run_id: str, recipe: AutomationRecipe | None = None, resume: bool = False) -> None:
         run = self.get_run(run_id)
         if not run:
             return
         plan: list[dict[str, Any]] = []
         try:
+            if recipe and recipe.status != "executable":
+                missing = ", ".join(recipe.missing_tools) if recipe.missing_tools else "missing executable steps"
+                raise ValueError(f"'{recipe.name}' is saved as {recipe.status}, not executable yet. Missing: {missing}.")
+
+            if recipe and recipe.engine == "openrpa":
+                await self._execute_openrpa_run(run, recipe)
+                return
+
+            if run.create_recipe and not recipe:
+                await self._execute_recipe_builder_run(run, resume=resume)
+                return
+
+            if not recipe and self._should_use_runtime_loop(run.prompt, resume=resume):
+                await self._execute_runtime_loop(run, resume=resume)
+                return
+
             self._set_status(run, "planning")
             self._append_event(run, "planning", "Planning automation steps.")
             if BLOCKED_PROMPT_PATTERN.search(run.prompt) and not self._looks_like_destructive_windows_file_action(run.prompt):
@@ -275,15 +489,15 @@ class AutomationService:
 
             self._set_status(run, "running")
             self._append_event(run, "plan_ready", f"Prepared {len(plan)} automation steps.", {"steps": plan})
-            for step in plan:
+            for index, step in enumerate(plan):
                 await self._execute_step(run, step)
-                if run.status in {"cancelled", "error"}:
+                if run.status in {"cancelled", "error", "waiting_for_login", "waiting_for_user", "confirmation_required"}:
                     return
+                if step["tool"] == "system.ask_user" and index == len(plan) - 1:
+                    raise ValueError("Astra asked for input but did not have any executable follow-up steps, so it did not mark the task complete.")
 
             if run.create_recipe or any(step["tool"] == "automation.save_recipe" for step in plan):
-                recipe = self.create_recipe(
-                    AutomationRecipeCreateRequest(name=self._recipe_name(run.prompt), prompt=run.prompt, steps=[step for step in plan if step["tool"] != "automation.save_recipe"])
-                )
+                recipe = self._build_recipe_from_goal(run.prompt, plan, source_prompt=run.prompt)
                 run.recipe_id = recipe.id
                 self._append_event(run, "recipe_saved", f"Saved automation: {recipe.name}.", {"recipe": recipe.model_dump(mode="json")})
 
@@ -305,18 +519,286 @@ class AutomationService:
                 self._cancel_events.pop(run.id, None)
                 self._continue_events.pop(run.id, None)
                 self._confirmation_futures.pop(run.id, None)
+                self._runtime_context.pop(run.id, None)
+                self._run_tasks.pop(run.id, None)
                 self._clear_active_download_process(run.id)
+            elif run.status == "waiting_for_user":
+                self._run_tasks.pop(run.id, None)
+
+    def _should_use_runtime_loop(self, prompt: str, resume: bool = False) -> bool:
+        if resume:
+            return True
+        if self._should_use_stable_plan(prompt):
+            return False
+        return bool(self.runtime.local_plan(prompt))
+
+    async def _execute_recipe_builder_run(self, run: AutomationRun, resume: bool = False) -> None:
+        self._set_status(run, "planning")
+        self._append_event(run, "planning", "Planning reusable automation recipe.")
+        state = self._runtime_context_for(run)
+        clarification = str(state.get("pending_input") or "").strip()
+
+        if self.builder.needs_goal(run.prompt) and not self._useful_continue_note(clarification):
+            self._append_event(
+                run,
+                "plan_ready",
+                "Prepared 1 recipe-builder step.",
+                {"steps": [{"tool": "system.ask_user", "description": "Ask what automation to create.", "args": {}}]},
+            )
+            self._append_event(
+                run,
+                "step",
+                "Ask what automation should be created.",
+                {"step": {"tool": "system.ask_user", "description": "Ask what automation should be created.", "args": {}}},
+            )
+            await self._wait_for_user(
+                run,
+                "What kind of automation would you like to create? Describe the task or workflow to automate.",
+                status="waiting_for_user",
+            )
+            state = self._runtime_context_for(run)
+            clarification = str(state.get("pending_input") or "").strip()
+
+        goal = self.builder.extract_goal(run.prompt, clarification)
+        if not goal or self.builder.needs_goal(goal):
+            raise ValueError("Astra needs a concrete automation goal before it can build a reusable workflow.")
+        if BLOCKED_PROMPT_PATTERN.search(goal) and not self._looks_like_destructive_windows_file_action(goal):
+            raise ValueError("This automation recipe is blocked by the safety policy.")
+
+        planned_steps = await self._plan_steps(goal)
+        recipe = self._build_recipe_from_goal(goal, planned_steps, source_prompt=run.prompt)
+        run.recipe_id = recipe.id
+
+        self._append_event(
+            run,
+            "recipe_saved",
+            self._recipe_saved_message(recipe),
+            {"recipe": recipe.model_dump(mode="json"), "status": recipe.status, "missing_tools": recipe.missing_tools},
+        )
+        run.result = self._recipe_saved_message(recipe)
+        self._set_status(run, "complete")
+        self._append_event(run, "complete", run.result, {"recipe_id": recipe.id, "recipe_status": recipe.status})
+
+    def _build_recipe_from_goal(self, goal: str, planned_steps: list[dict[str, Any]] | None = None, source_prompt: str = "") -> AutomationRecipe:
+        build = self.builder.build(goal, planned_steps=planned_steps, source_prompt=source_prompt)
+        return self.create_recipe(build.request)
+
+    def _recipe_saved_message(self, recipe: AutomationRecipe) -> str:
+        if recipe.status == "executable":
+            return f"Saved executable automation: {recipe.name}."
+        if recipe.status == "needs_tools":
+            missing = ", ".join(recipe.missing_tools) if recipe.missing_tools else "additional tools"
+            return f"Saved draft automation: {recipe.name}. It needs tools before it can run: {missing}."
+        return f"Saved draft automation: {recipe.name}."
+
+    async def _execute_openrpa_run(self, run: AutomationRun, recipe: AutomationRecipe) -> None:
+        self._set_status(run, "planning")
+        self._append_event(
+            run,
+            "openrpa_queued",
+            f"Preparing OpenRPA workflow: {recipe.name}.",
+            {"engine": "openrpa", "recipe_id": recipe.id, "workflow_ref_type": recipe.workflow_ref_type},
+        )
+        self._assert_openrpa_recipe_allowed(recipe)
+
+        status = self.openrpa.status()
+        if not status.installed:
+            raise OpenRPAMissingError(status.message)
+
+        inputs = self._openrpa_run_inputs(run, recipe)
+        missing_inputs = self._missing_openrpa_inputs(recipe, inputs)
+        if missing_inputs:
+            await self._wait_for_user(
+                run,
+                f"OpenRPA workflow '{recipe.name}' needs input: {', '.join(missing_inputs)}. Reply with key=value pairs.",
+                status="waiting_for_user",
+                event_type="openrpa_input_required",
+            )
+            self._raise_if_cancelled(run.id)
+            note = str(self._runtime_context_for(run).get("pending_input") or "")
+            inputs.update(self._parse_openrpa_continue_inputs(note, missing_inputs))
+            state = self._runtime_context_for(run)
+            state["inputs"] = dict(inputs)
+            self._sync_runtime_context_to_run(run)
+            missing_inputs = self._missing_openrpa_inputs(recipe, inputs)
+            if missing_inputs:
+                raise ValueError(f"OpenRPA workflow is missing required input: {', '.join(missing_inputs)}.")
+
+        if recipe.risk == "safe_confirm":
+            approved = await self._wait_for_confirmation(
+                run,
+                {
+                    "tool": "openrpa.workflow",
+                    "description": f"Launch OpenRPA workflow '{recipe.name}'.",
+                    "args": {
+                        "engine": "openrpa",
+                        "workflow_ref": recipe.workflow_ref,
+                        "workflow_ref_type": recipe.workflow_ref_type,
+                        "inputs": list(inputs.keys()),
+                    },
+                },
+            )
+            if not approved:
+                run.result = "OpenRPA workflow cancelled before launch."
+                self._set_status(run, "cancelled")
+                self._append_event(run, "cancelled", run.result)
+                return
+
+        self._set_status(run, "running")
+        self._append_event(
+            run,
+            "openrpa_start",
+            f"Launching OpenRPA workflow: {recipe.name}.",
+            {
+                "engine": "openrpa",
+                "recipe_id": recipe.id,
+                "workflow_ref": recipe.workflow_ref,
+                "workflow_ref_type": recipe.workflow_ref_type,
+                "inputs": list(inputs.keys()),
+                "timeout_seconds": recipe.timeout_seconds,
+            },
+        )
+
+        def on_openrpa_event(event_type: str, message: str, data: dict[str, Any]) -> None:
+            self._append_event(
+                run,
+                f"openrpa_{event_type}",
+                message,
+                {"engine": "openrpa", "recipe_id": recipe.id, **(data or {})},
+            )
+
+        try:
+            result = await asyncio.to_thread(
+                self.openrpa.run,
+                recipe,
+                inputs,
+                self._cancel_event_for_run(run.id),
+                on_openrpa_event,
+            )
+        except OpenRPACancelledError as exc:
+            raise AutomationCancelledError(str(exc)) from exc
+
+        if result.returncode != 0:
+            details = "\n".join(part for part in [result.stderr, result.stdout] if part).strip()
+            raise ValueError(f"OpenRPA workflow failed with exit code {result.returncode}: {details[-1200:]}")
+
+        output = result.stdout or result.stderr
+        run.result = output[-3000:] if output else f"OpenRPA workflow '{recipe.name}' completed."
+        self._set_status(run, "complete")
+        self._append_event(
+            run,
+            "openrpa_complete",
+            f"OpenRPA workflow completed: {recipe.name}.",
+            {
+                "engine": "openrpa",
+                "recipe_id": recipe.id,
+                "elapsed_seconds": round(result.elapsed_seconds, 2),
+                "exit_code": result.returncode,
+            },
+        )
+        self._append_event(run, "complete", run.result, {"engine": "openrpa", "recipe_id": recipe.id})
+
+    def _openrpa_run_inputs(self, run: AutomationRun, recipe: AutomationRecipe) -> dict[str, Any]:
+        state = self._runtime_context_for(run)
+        raw_inputs = state.get("inputs") if isinstance(state.get("inputs"), dict) else {}
+        allowed = set(recipe.inputs)
+        return {str(key): value for key, value in dict(raw_inputs).items() if str(key) in allowed}
+
+    def _missing_openrpa_inputs(self, recipe: AutomationRecipe, inputs: dict[str, Any]) -> list[str]:
+        missing: list[str] = []
+        for input_name in recipe.inputs:
+            value = inputs.get(input_name)
+            if value is None or str(value).strip() == "":
+                missing.append(input_name)
+        return missing
+
+    def _parse_openrpa_continue_inputs(self, note: str, missing_inputs: list[str]) -> dict[str, str]:
+        clean_note = note.strip()
+        if not clean_note:
+            return {}
+        parsed_json = self._extract_json(clean_note)
+        if isinstance(parsed_json, dict) and parsed_json:
+            return {str(key).strip(): str(value).strip() for key, value in parsed_json.items() if str(key).strip()}
+
+        pairs: dict[str, str] = {}
+        for chunk in re.split(r"[\n,;]+", clean_note):
+            if "=" not in chunk:
+                continue
+            key, value = chunk.split("=", 1)
+            key = key.strip()
+            if key:
+                pairs[key] = value.strip()
+        if not pairs and len(missing_inputs) == 1:
+            pairs[missing_inputs[0]] = clean_note
+        return pairs
+
+    async def _execute_runtime_loop(self, run: AutomationRun, resume: bool = False) -> None:
+        state = self._runtime_context_for(run)
+        state["goal"] = run.prompt
+        state.setdefault("failure_history", [])
+        if not resume:
+            self._set_status(run, "planning")
+            self._append_event(run, "planning", "Planning automation steps.")
+        else:
+            self._append_event(run, "replanned", "Replanning with the latest user input and artifact context.", {"agent_state": state})
+
+        if BLOCKED_PROMPT_PATTERN.search(run.prompt) and not self._looks_like_destructive_windows_file_action(run.prompt):
+            raise ValueError("This automation request is blocked by the safety policy.")
+
+        self._set_status(run, "running")
+        for _index in range(MAX_RUNTIME_LOOP_STEPS):
+            self._raise_if_cancelled(run.id)
+            state = self._runtime_context_for(run)
+            state["step_count"] = int(state.get("step_count") or 0) + 1
+            self._sync_runtime_context_to_run(run)
+            action = await self.runtime.plan_next_action(run.prompt, run.agent_state, current_url=run.current_url, allow_llm=self._automation_llm_available())
+            if not action:
+                raise ValueError("Astra could not choose the next runtime action.")
+            step = self._sanitize_steps([action])
+            if not step:
+                self._append_event(run, "replanned", "Planner returned an unsafe or unknown tool, so Astra replanned.", {"action": action})
+                self._append_failure(run, action, "Planner returned an unsafe or unknown tool.")
+                if len(self._runtime_context_for(run).get("failure_history", [])) >= 2:
+                    raise ValueError("Astra could not create a safe next action.")
+                continue
+
+            next_step = step[0]
+            event_type = "plan_ready" if int(state.get("step_count") or 0) == 1 and not resume else "replanned"
+            self._append_event(run, event_type, f"Next action: {next_step['description']}", {"step": next_step, "agent_state": run.agent_state})
+            result = await self._execute_runtime_step(run, next_step)
+            self._record_runtime_result(run, next_step, result)
+
+            if result["status"] == "complete":
+                self._set_status(run, "complete")
+                self._append_event(run, "complete", run.result or result["message"] or "Automation completed.", {"current_url": run.current_url})
+                return
+            if result["status"] == "needs_input":
+                self._save_run(run)
+                return
+            if result["status"] == "failed":
+                self._append_failure(run, next_step, result["message"])
+                self._append_event(run, "replanned", "Astra will replan after the failed tool action.", {"failure": result, "step": next_step})
+                if len(self._runtime_context_for(run).get("failure_history", [])) >= 2:
+                    raise ValueError(result["message"] or "Runtime action failed.")
+                continue
+
+        raise ValueError("Astra reached the runtime step limit before completing the task.")
 
     async def _plan_steps(self, prompt: str) -> list[dict[str, Any]]:
-        if self._should_use_stable_plan(prompt):
-            return self._heuristic_plan(prompt)
-        if self.settings.has_cerebras:
+        message_steps = self.builder.message_steps_for_goal(prompt)
+        if message_steps:
+            return message_steps
+
+        use_stable_plan = self._should_use_stable_plan(prompt)
+        if not use_stable_plan:
             try:
-                llm_steps = await self._plan_with_llm(prompt)
-                if llm_steps:
-                    return llm_steps
+                runtime_steps = await self.runtime.plan(prompt, allow_llm=self._automation_llm_available())
+                if runtime_steps:
+                    return runtime_steps
             except Exception:
                 pass
+        if use_stable_plan:
+            return self._heuristic_plan(prompt)
         return self._heuristic_plan(prompt)
 
     def _should_use_stable_plan(self, prompt: str) -> bool:
@@ -330,19 +812,23 @@ class AutomationService:
         return bool(self._extract_url(prompt))
 
     async def _plan_with_llm(self, prompt: str) -> list[dict[str, Any]]:
-        system_prompt = (
-            "You are Astra's automation planner. Return only strict JSON with a top-level steps array. "
-            f"Allowed tool values: {sorted(ALLOWED_AUTOMATION_TOOLS)}. "
-            "Each step must be {tool, description, args}. Keep actions safe and ask for user/login waits when needed. "
-            "Never output tools outside the enum."
-        )
-        user_prompt = f"User automation request: {prompt}"
+        return await self.runtime.plan(prompt, allow_llm=True)
+
+    def _automation_planner_model(self) -> str:
         model_selector = getattr(self.llm, "model_for_profile", None)
-        model = model_selector("pro") if callable(model_selector) else self.settings.resolved_cerebras_pro_model
-        raw, _setup = await self.llm.complete(system_prompt, user_prompt, model=model)
-        payload = self._extract_json(raw)
-        steps = payload.get("steps") if isinstance(payload, dict) else None
-        return steps if isinstance(steps, list) else []
+        if callable(model_selector):
+            return model_selector(AUTOMATION_LLM_PROFILE)
+        return self.settings.resolved_cerebras_pro_model
+
+    def _automation_llm_available(self) -> bool:
+        model = self._automation_planner_model()
+        provider = model.split(":", 1)[0].strip().lower() if ":" in model else "cerebras"
+        provider_configured = getattr(self.llm, "provider_configured", None)
+        if callable(provider_configured):
+            return bool(provider_configured(provider))
+        if provider == "nvidia":
+            return self.settings.has_nvidia
+        return self.settings.has_cerebras
 
     def _heuristic_plan(self, prompt: str) -> list[dict[str, Any]]:
         normalized = prompt.lower()
@@ -357,13 +843,13 @@ class AutomationService:
             return steps
 
         if url := self._extract_url(prompt):
-            steps.append({"tool": "browser.open", "description": f"Open {url}.", "args": {"url": url}})
             if "download" in normalized:
                 if self._looks_like_direct_file(url) and not self._is_youtube_url(url):
-                    steps.append({"tool": "browser.download", "description": "Download from the opened direct URL.", "args": {"url": url}})
+                    steps.append({"tool": "browser.download", "description": "Download from the direct URL.", "args": {"url": url}})
                 else:
-                    steps.append({"tool": "video.download_permitted", "description": "Download the opened video after rights confirmation.", "args": {"url": url}})
+                    steps.append({"tool": "video.download_permitted", "description": "Download the provided public video URL.", "args": {"url": url}})
             else:
+                steps.append({"tool": "browser.open", "description": f"Open {url}.", "args": {"url": url}})
                 steps.append({"tool": "browser.extract", "description": "Extract page content.", "args": {"target": "page content"}})
         elif "gmail" in normalized or "mail.google" in normalized:
             steps.append({"tool": "browser.open", "description": "Open Gmail.", "args": {"url": "https://mail.google.com/"}})
@@ -376,7 +862,7 @@ class AutomationService:
                 steps.append({"tool": "browser.open", "description": "Open YouTube.", "args": {"url": "https://www.youtube.com/"}})
             if "download" in normalized:
                 steps.append({"tool": "browser.click", "description": "Open the first visible YouTube result.", "args": {"selector": "ytd-video-renderer a#thumbnail"}})
-                steps.append({"tool": "video.download_permitted", "description": "Download the opened video after rights confirmation.", "args": {}})
+                steps.append({"tool": "video.download_permitted", "description": "Download the opened public video.", "args": {}})
             elif "play" in normalized:
                 steps.append({"tool": "browser.click", "description": "Open the first visible result.", "args": {"selector": "ytd-video-renderer a#thumbnail"}})
             else:
@@ -525,6 +1011,10 @@ class AutomationService:
     def _normalize_prompt(self, prompt: str) -> str:
         return re.sub(r"\s+", " ", prompt.lower()).strip()
 
+    def _useful_continue_note(self, note: str) -> bool:
+        compact = re.sub(r"[^a-z0-9]+", " ", note.lower()).strip()
+        return bool(compact and compact not in {"continue", "ready", "user is ready to continue", "ok", "okay", "yes", "y"})
+
     def _now(self) -> datetime:
         return datetime.now()
 
@@ -534,10 +1024,76 @@ class AutomationService:
             if not isinstance(raw, dict):
                 continue
             tool = str(raw.get("tool") or "").strip()
+            tool = {"video.download": "video.download_permitted", "automation.run_python_safe": "python.run_safe"}.get(tool, tool)
             if tool not in ALLOWED_AUTOMATION_TOOLS:
                 continue
             args = raw.get("args") if isinstance(raw.get("args"), dict) else {}
             description = str(raw.get("description") or tool).strip()[:240]
+            if tool in {"artifact.resolve_reference", "file.search_scoped"}:
+                args["query"] = str(args.get("query") or "").strip()[:240]
+                media_types = args.get("media_types")
+                args["media_types"] = [str(item).strip().lower() for item in media_types[:6]] if isinstance(media_types, list) else []
+                if not args["query"]:
+                    continue
+            if tool == "artifact.list_recent":
+                media_types = args.get("media_types")
+                args["media_types"] = [str(item).strip().lower() for item in media_types[:6]] if isinstance(media_types, list) else []
+                try:
+                    args["limit"] = min(25, max(1, int(args.get("limit") or 10)))
+                except (TypeError, ValueError):
+                    args["limit"] = 10
+            if tool == "artifact.pick":
+                args["artifact_id"] = str(args.get("artifact_id") or "").strip()[:80]
+                if not args["artifact_id"]:
+                    continue
+            if tool == "app.resolve":
+                args["app_name"] = str(args.get("app_name") or "default").strip()[:80]
+            if tool == "app.open":
+                args["app_name"] = str(args.get("app_name") or "").strip()[:80]
+                if not args["app_name"]:
+                    continue
+            if tool in {"app.open_with_file", "file.open", "artifact.open_containing_folder"}:
+                args["artifact_id"] = str(args.get("artifact_id") or "").strip()[:80]
+                args["reference"] = str(args.get("reference") or args.get("query") or "").strip()[:240]
+                args["app_name"] = str(args.get("app_name") or "default").strip()[:80]
+                args["path"] = str(args.get("path") or "").strip()[:500]
+            if tool in {"desktop.find_text", "desktop.verify_text"}:
+                args["text"] = str(args.get("text") or "").strip()[:240]
+                args["app_name"] = str(args.get("app_name") or "").strip()[:80]
+                args["control_types"] = self._sanitize_string_list(args.get("control_types"), limit=8)
+                args["exclude_control_types"] = self._sanitize_string_list(args.get("exclude_control_types"), limit=8)
+                try:
+                    args["timeout"] = min(20, max(1, int(args.get("timeout") or 8)))
+                except (TypeError, ValueError):
+                    args["timeout"] = 8
+                if not args["text"]:
+                    continue
+            if tool == "desktop.click":
+                target = args.get("target")
+                args["target"] = target if isinstance(target, dict) else str(target or "").strip()[:240]
+                args["text"] = str(args.get("text") or "").strip()[:240]
+                args["button"] = str(args.get("button") or "left").strip().lower()[:20]
+                if args["button"] not in {"left", "right"}:
+                    args["button"] = "left"
+                if not args["target"] and not args["text"]:
+                    continue
+            if tool == "desktop.type_text":
+                args["text"] = str(args.get("text") or "").strip()[:1000]
+                args["replace"] = bool(args.get("replace"))
+                if not args["text"]:
+                    continue
+            if tool == "desktop.press_key":
+                key = str(args.get("key") or "").strip().lower()
+                key = {"return": "enter", "esc": "escape"}.get(key, key)
+                if key not in {"enter", "tab", "escape", "backspace", "delete", "space"}:
+                    continue
+                args["key"] = key
+            if tool == "system.ask_user":
+                args["message"] = str(args.get("message") or description).strip()[:300]
+            if tool == "task.finish":
+                args["message"] = str(args.get("message") or description).strip()[:500]
+            if tool == "task.replan":
+                args["reason"] = str(args.get("reason") or description).strip()[:300]
             if tool == "browser.open":
                 url = str(args.get("url") or "").strip()
                 if not self._valid_http_url(url):
@@ -568,10 +1124,67 @@ class AutomationService:
                 args["expression"] = expression[:80] if expression and CALCULATOR_EXPRESSION_PATTERN.fullmatch(expression) else ""
             if tool == "windows.open_file_explorer":
                 args["target"] = str(args.get("target") or "").strip()[:260]
+            if tool == "windows.prepare_whatsapp_message":
+                args["contact"] = str(args.get("contact") or "").strip()[:120]
+                args["message"] = str(args.get("message") or "").strip()[:500]
+                if not args["contact"] or not args["message"]:
+                    continue
             if tool == "windows.reject_destructive_file_action":
                 args["reason"] = str(args.get("reason") or "Astra blocked this destructive file action.").strip()[:240]
             clean_steps.append({"tool": tool, "description": description, "args": args})
         return clean_steps
+
+    def _sanitize_recipe_draft_steps(self, steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        allowed_draft_tools = ALLOWED_AUTOMATION_TOOLS | FUTURE_DESKTOP_TOOLS | {"app.open"}
+        clean_steps: list[dict[str, Any]] = []
+        for raw in steps:
+            if not isinstance(raw, dict):
+                continue
+            tool = str(raw.get("tool") or "").strip()
+            tool = {"video.download": "video.download_permitted", "automation.run_python_safe": "python.run_safe"}.get(tool, tool)
+            if tool not in allowed_draft_tools:
+                continue
+            args = raw.get("args") if isinstance(raw.get("args"), dict) else {}
+            clean_args = {str(key)[:80]: self._safe_recipe_arg(value) for key, value in args.items() if str(key).strip()}
+            clean_steps.append(
+                {
+                    "tool": tool,
+                    "description": str(raw.get("description") or tool).strip()[:240],
+                    "args": clean_args,
+                }
+            )
+        return clean_steps
+
+    def _safe_recipe_arg(self, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip()[:1000]
+        if isinstance(value, bool) or value is None:
+            return value
+        if isinstance(value, (int, float)):
+            return value
+        if isinstance(value, list):
+            return [self._safe_recipe_arg(item) for item in value[:20]]
+        if isinstance(value, dict):
+            return {str(key)[:80]: self._safe_recipe_arg(item) for key, item in list(value.items())[:20]}
+        return str(value)[:500]
+
+    def _dedupe_strings(self, values: list[str], limit: int = 20) -> list[str]:
+        result: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            clean = str(value or "").strip()[:160]
+            key = clean.lower()
+            if clean and key not in seen:
+                seen.add(key)
+                result.append(clean)
+            if len(result) >= limit:
+                break
+        return result
+
+    def _sanitize_string_list(self, value: Any, limit: int = 10) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return self._dedupe_strings([str(item) for item in value], limit=limit)
 
     async def _execute_step(self, run: AutomationRun, step: dict[str, Any]) -> None:
         tool = step["tool"]
@@ -602,18 +1215,86 @@ class AutomationService:
             await self._wait_for_user(run, str(step["args"].get("reason") or step["description"]))
         elif tool == "browser.download":
             await self._tool_browser_download(run, step["args"])
+        elif tool in {"artifact.resolve_reference", "file.search_scoped"}:
+            await self._tool_artifact_resolve_reference(run, step["args"])
+        elif tool == "artifact.list_recent":
+            await self._tool_artifact_list_recent(run, step["args"])
+        elif tool == "artifact.pick":
+            await self._tool_artifact_pick(run, step["args"])
+        elif tool == "artifact.open_containing_folder":
+            await self._tool_artifact_open_containing_folder(run, step["args"])
+        elif tool == "app.resolve":
+            await self._tool_app_resolve(run, step["args"])
+        elif tool == "app.open":
+            await self._tool_app_open(run, step["args"])
+        elif tool in {"app.open_with_file", "file.open"}:
+            await self._tool_app_open_with_file(run, step["args"])
+        elif tool == "desktop.find_text":
+            await self._tool_desktop_find_text(run, step["args"])
+        elif tool == "desktop.click":
+            await self._tool_desktop_click(run, step["args"])
+        elif tool == "desktop.type_text":
+            await self._tool_desktop_type_text(run, step["args"])
+        elif tool == "desktop.press_key":
+            await self._tool_desktop_press_key(run, step["args"])
+        elif tool == "desktop.verify_text":
+            await self._tool_desktop_verify_text(run, step["args"])
         elif tool == "python.run_safe":
             await self._tool_python_run_safe(run, step["args"]["code"])
         elif tool == "video.download_permitted":
             await self._tool_video_download_permitted(run, step["args"])
+        elif tool == "system.ask_user":
+            await self._wait_for_user(run, str(step["args"].get("message") or step["description"]), status="waiting_for_user")
         elif tool == "windows.set_alarm":
             await self._tool_windows_set_alarm(run, step["args"])
         elif tool == "windows.open_calculator":
             await self._tool_windows_open_calculator(run, step["args"])
         elif tool == "windows.open_file_explorer":
             await self._tool_windows_open_file_explorer(run, step["args"])
+        elif tool == "windows.prepare_whatsapp_message":
+            await self._tool_windows_prepare_whatsapp_message(run, step["args"])
         elif tool == "windows.reject_destructive_file_action":
             await self._tool_windows_reject_destructive_file_action(run, step["args"])
+        elif tool == "task.finish":
+            run.result = str(step["args"].get("message") or run.result or "Automation completed.").strip()
+            self._append_event(run, "verified", run.result, {"step": step})
+        elif tool == "task.replan":
+            self._append_event(run, "replanned", str(step["args"].get("reason") or "Replanning automation."), {"step": step})
+
+    async def _execute_runtime_step(self, run: AutomationRun, step: dict[str, Any]) -> dict[str, Any]:
+        try:
+            before_status = run.status
+            before_event_count = len(run.events)
+            await self._execute_step(run, step)
+            if run.status in {"waiting_for_user", "waiting_for_login"}:
+                return {"status": "needs_input", "message": run.result or run.events[-1].message if run.events else "Astra needs input.", "data": run.agent_state}
+            if run.status in {"cancelled", "error"}:
+                return {"status": "failed", "message": run.error or run.result or f"Runtime step ended as {run.status}.", "data": {}}
+            if step["tool"] == "task.finish":
+                return {"status": "complete", "message": run.result or "Automation completed.", "data": {}}
+            new_events = run.events[before_event_count:]
+            message = new_events[-1].message if new_events else run.result or step["description"]
+            return {"status": "success", "message": message, "data": {"previous_status": before_status, "events": [event.model_dump(mode="json") for event in new_events]}}
+        except AutomationCancelledError:
+            raise
+        except Exception as exc:
+            return {"status": "failed", "message": self._format_exception(exc), "data": {"step": step}}
+
+    def _record_runtime_result(self, run: AutomationRun, step: dict[str, Any], result: dict[str, Any]) -> None:
+        state = self._runtime_context_for(run)
+        state["last_tool"] = step["tool"]
+        state["last_tool_status"] = result["status"]
+        state["last_result"] = result["message"]
+        self._sync_runtime_context_to_run(run)
+
+    def _append_failure(self, run: AutomationRun, step_or_action: dict[str, Any], message: str) -> None:
+        state = self._runtime_context_for(run)
+        failures = state.get("failure_history")
+        if not isinstance(failures, list):
+            failures = []
+        failures.append({"tool": step_or_action.get("tool", ""), "message": message, "at": datetime.utcnow().isoformat()})
+        state["failure_history"] = failures[-5:]
+        self._sync_runtime_context_to_run(run)
 
     async def _tool_windows_set_alarm(self, run: AutomationRun, args: dict[str, Any]) -> None:
         if args.get("error"):
@@ -658,6 +1339,20 @@ class AutomationService:
         self._append_windows_result(run, result)
         if not result.ok:
             raise ValueError(result.message)
+        run.result = result.message
+
+    async def _tool_windows_prepare_whatsapp_message(self, run: AutomationRun, args: dict[str, Any]) -> None:
+        contact = str(args.get("contact") or "").strip()
+        message = str(args.get("message") or "").strip()
+        result = await asyncio.to_thread(self.windows.prepare_whatsapp_message, contact, message)
+        self._append_windows_result(run, result)
+        if not result.ok:
+            raise ValueError(result.message)
+        context = self._runtime_context_for(run)
+        context["last_app_name"] = "WhatsApp"
+        context["whatsapp_contact"] = contact
+        context["whatsapp_message_length"] = len(message)
+        self._sync_runtime_context_to_run(run)
         run.result = result.message
 
     async def _tool_windows_reject_destructive_file_action(self, run: AutomationRun, args: dict[str, Any]) -> None:
@@ -765,7 +1460,8 @@ class AutomationService:
             target = self.downloads_dir / filename
             target.write_bytes(await response.body())
             run.result = f"Downloaded {target.name}."
-            self._append_event(run, "download", run.result, {"path": str(target), "filename": target.name})
+            artifact = self._record_download_artifact(run, target, source_url=url, title=target.stem)
+            self._append_event(run, "download", run.result, {"path": str(target), "filename": target.name, "artifact": artifact.model_dump(mode="json")})
             return
         else:
             try:
@@ -780,7 +1476,212 @@ class AutomationService:
         target = self.downloads_dir / self._safe_filename(suggested)
         await download.save_as(str(target))
         run.result = f"Downloaded {target.name}."
-        self._append_event(run, "download", run.result, {"path": str(target), "filename": target.name})
+        artifact = self._record_download_artifact(run, target, source_url=page.url if page else "", title=target.stem)
+        self._append_event(run, "download", run.result, {"path": str(target), "filename": target.name, "artifact": artifact.model_dump(mode="json")})
+
+    async def _tool_artifact_resolve_reference(self, run: AutomationRun, args: dict[str, Any]) -> None:
+        state = self._runtime_context_for(run)
+        selected_artifact_id = str(args.get("artifact_id") or state.get("selected_artifact_id") or "").strip()
+        if selected_artifact_id:
+            await self._tool_artifact_pick(run, {"artifact_id": selected_artifact_id})
+            return
+        query = str(args.get("query") or state.get("pending_input") or run.prompt).strip()
+        if not self._useful_continue_note(query):
+            query = run.prompt
+        media_types = args.get("media_types") if isinstance(args.get("media_types"), list) else []
+        preferred_artifact_id = str(state.get("last_artifact_id") or "").strip()
+        artifact, matches, reason = self.artifacts.resolve_reference(query, media_types=media_types, preferred_artifact_id=preferred_artifact_id)
+        if not artifact:
+            choices = [
+                {"id": item.id, "title": item.title, "filename": item.filename, "media_type": item.media_type, "path": item.path}
+                for item in matches[:5]
+            ]
+            message = reason or "Astra could not resolve which artifact to use."
+            if choices:
+                message = f"{message} Matching files: " + ", ".join(item["filename"] for item in choices)
+            run.result = message
+            state["candidates"] = choices
+            state["pending_reason"] = message
+            self._sync_runtime_context_to_run(run)
+            self._append_event(run, "waiting_for_user", message, {"query": query, "matches": choices, "candidates": choices})
+            self._set_status(run, "waiting_for_user")
+            return
+
+        state["last_artifact_id"] = artifact.id
+        state.pop("selected_artifact_id", None)
+        state.pop("pending_input", None)
+        state.pop("pending_reason", None)
+        state["candidates"] = []
+        self._sync_runtime_context_to_run(run)
+        self._append_event(
+            run,
+            "artifact_resolved",
+            f"Resolved {artifact.filename}.",
+            {
+                "artifact": artifact.model_dump(mode="json"),
+                "artifact_id": artifact.id,
+                "filename": artifact.filename,
+                "path": artifact.path,
+                "matches": [item.model_dump(mode="json") for item in matches[:5]],
+            },
+        )
+
+    async def _tool_artifact_list_recent(self, run: AutomationRun, args: dict[str, Any]) -> None:
+        media_types = args.get("media_types") if isinstance(args.get("media_types"), list) else []
+        limit = int(args.get("limit") or 10)
+        artifacts = self.artifacts.list_recent(media_types=media_types, limit=limit)
+        run.result = "Recent artifacts: " + ", ".join(item.filename for item in artifacts) if artifacts else "No Astra artifacts found yet."
+        self._append_event(
+            run,
+            "artifact_list",
+            run.result,
+            {"artifacts": [artifact.model_dump(mode="json") for artifact in artifacts]},
+        )
+
+    async def _tool_artifact_pick(self, run: AutomationRun, args: dict[str, Any]) -> None:
+        artifact_id = str(args.get("artifact_id") or "").strip()
+        artifact = self.artifacts.get(artifact_id)
+        if not artifact:
+            raise ValueError("The selected artifact is no longer available.")
+        state = self._runtime_context_for(run)
+        state["last_artifact_id"] = artifact.id
+        state.pop("selected_artifact_id", None)
+        state.pop("pending_input", None)
+        state["candidates"] = []
+        self._sync_runtime_context_to_run(run)
+        self._append_event(
+            run,
+            "artifact_resolved",
+            f"Selected {artifact.filename}.",
+            {"artifact": artifact.model_dump(mode="json"), "artifact_id": artifact.id, "filename": artifact.filename, "path": artifact.path},
+        )
+
+    async def _tool_artifact_open_containing_folder(self, run: AutomationRun, args: dict[str, Any]) -> None:
+        artifact = self._artifact_from_args_or_context(run, args)
+        if not artifact:
+            raise ValueError("Astra could not resolve which artifact folder to open.")
+        result = await asyncio.to_thread(self.runtime.open_artifact_containing_folder, artifact)
+        state = self._runtime_context_for(run)
+        state["last_artifact_id"] = artifact.id
+        run.result = f"Opened the folder containing {artifact.filename}."
+        self._sync_runtime_context_to_run(run)
+        self._append_event(
+            run,
+            "folder_opened",
+            run.result,
+            {
+                **result,
+                "artifact": artifact.model_dump(mode="json"),
+                "filename": artifact.filename,
+                "path": artifact.path,
+            },
+        )
+
+    async def _tool_app_resolve(self, run: AutomationRun, args: dict[str, Any]) -> None:
+        app_name = str(args.get("app_name") or "default")
+        app = self.runtime.resolve_app(app_name)
+        context = self._runtime_context_for(run)
+        context["last_app_name"] = str(app.get("app_name") or app_name)
+        context["last_app_path"] = str(app.get("path") or "")
+        self._sync_runtime_context_to_run(run)
+        self._append_event(run, "app_resolved", f"Resolved app: {context['last_app_name']}.", {"app": app})
+
+    async def _tool_app_open(self, run: AutomationRun, args: dict[str, Any]) -> None:
+        app_name = str(args.get("app_name") or self._runtime_context_for(run).get("last_app_name") or "").strip()
+        if not app_name:
+            raise ValueError("Desktop app open step needs an app name.")
+        result = await asyncio.to_thread(self.windows.open_app, app_name)
+        self._append_windows_result(run, result)
+        if not result.ok:
+            raise ValueError(result.message)
+        context = self._runtime_context_for(run)
+        context["last_app_name"] = str(result.data.get("app") or app_name)
+        self._sync_runtime_context_to_run(run)
+        run.result = result.message
+
+    async def _tool_app_open_with_file(self, run: AutomationRun, args: dict[str, Any]) -> None:
+        context = self._runtime_context_for(run)
+        artifact = self._artifact_from_args_or_context(run, args)
+        if not artifact:
+            raise ValueError("Astra could not resolve which artifact to open.")
+        app_name = str(args.get("app_name") or context.get("last_app_name") or "default").strip() or "default"
+        result = await asyncio.to_thread(self.runtime.open_artifact_with_app, artifact, app_name)
+        context["last_artifact_id"] = artifact.id
+        context["last_app_name"] = str(result.get("app", {}).get("app_name") or app_name)
+        run.result = f"Opened {artifact.filename} with {context['last_app_name']}."
+        self._sync_runtime_context_to_run(run)
+        self._append_event(
+            run,
+            "app_opened",
+            run.result,
+            {
+                **result,
+                "filename": artifact.filename,
+                "path": artifact.path,
+                "artifact": artifact.model_dump(mode="json"),
+            },
+        )
+
+    async def _tool_desktop_find_text(self, run: AutomationRun, args: dict[str, Any]) -> None:
+        text = str(args.get("text") or "").strip()
+        app_name = str(args.get("app_name") or self._runtime_context_for(run).get("last_app_name") or "").strip()
+        timeout = int(args.get("timeout") or 8)
+        result = await asyncio.to_thread(
+            self.windows.find_text,
+            text,
+            app_name,
+            timeout,
+            args.get("control_types") if isinstance(args.get("control_types"), list) else [],
+            args.get("exclude_control_types") if isinstance(args.get("exclude_control_types"), list) else [],
+        )
+        self._append_windows_result(run, result)
+        if not result.ok:
+            raise ValueError(result.message)
+        target = result.data.get("target") if isinstance(result.data, dict) else None
+        if isinstance(target, dict):
+            context = self._runtime_context_for(run)
+            context["last_desktop_target"] = target
+            context["last_desktop_text"] = text
+            self._sync_runtime_context_to_run(run)
+        run.result = result.message
+
+    async def _tool_desktop_click(self, run: AutomationRun, args: dict[str, Any]) -> None:
+        context = self._runtime_context_for(run)
+        target: Any = args.get("target")
+        if target == "$found_text":
+            target = context.get("last_desktop_target")
+        text = str(args.get("text") or "").strip()
+        button = str(args.get("button") or "left").strip().lower()
+        result = await asyncio.to_thread(self.windows.click_target, target, text, button)
+        self._append_windows_result(run, result)
+        if not result.ok:
+            raise ValueError(result.message)
+        run.result = result.message
+
+    async def _tool_desktop_type_text(self, run: AutomationRun, args: dict[str, Any]) -> None:
+        text = str(args.get("text") or "")
+        result = await asyncio.to_thread(self.windows.type_text, text, bool(args.get("replace")))
+        self._append_windows_result(run, result)
+        if not result.ok:
+            raise ValueError(result.message)
+        run.result = result.message
+
+    async def _tool_desktop_press_key(self, run: AutomationRun, args: dict[str, Any]) -> None:
+        key = str(args.get("key") or "").strip().lower()
+        result = await asyncio.to_thread(self.windows.press_key, key)
+        self._append_windows_result(run, result)
+        if not result.ok:
+            raise ValueError(result.message)
+        run.result = result.message
+
+    async def _tool_desktop_verify_text(self, run: AutomationRun, args: dict[str, Any]) -> None:
+        text = str(args.get("text") or "").strip()
+        app_name = str(args.get("app_name") or self._runtime_context_for(run).get("last_app_name") or "").strip()
+        result = await asyncio.to_thread(self.windows.verify_text, text, app_name, int(args.get("timeout") or 6))
+        self._append_windows_result(run, result)
+        if not result.ok:
+            raise ValueError(result.message)
+        run.result = result.message
 
     async def _click_official_download_control(self, page: Any, selector: str) -> None:
         if selector:
@@ -845,6 +1746,14 @@ class AutomationService:
             raise ValueError(message) from exc
 
         run.result = f"Downloaded {result['filename']}."
+        artifact = self._record_download_artifact(
+            run,
+            result["path"],
+            source_url=source_url,
+            title=str(result.get("video_title") or result["filename"]),
+            metadata=result,
+        )
+        result = {**result, "artifact": artifact.model_dump(mode="json"), "artifact_id": artifact.id}
         self._append_event(run, "download_complete", run.result, result)
 
     def _download_video_with_ytdlp(self, run: AutomationRun, source_url: str, max_size_bytes: int) -> dict[str, Any]:
@@ -1230,6 +2139,58 @@ class AutomationService:
         run_download_dir.mkdir(parents=True, exist_ok=True)
         return run_download_dir
 
+    def _runtime_context_for(self, run: AutomationRun) -> dict[str, Any]:
+        if not isinstance(run.agent_state, dict):
+            run.agent_state = {}
+        context = self._runtime_context.setdefault(run.id, {})
+        for key, value in run.agent_state.items():
+            context.setdefault(key, value)
+        return context
+
+    def _sync_runtime_context_to_run(self, run: AutomationRun) -> None:
+        context = self._runtime_context.get(run.id)
+        if context is not None:
+            run.agent_state = dict(context)
+
+    def _artifact_from_args_or_context(self, run: AutomationRun, args: dict[str, Any]) -> AutomationArtifact | None:
+        artifact_id = str(args.get("artifact_id") or "").strip()
+        if artifact_id:
+            return self.artifacts.get(artifact_id)
+
+        path = str(args.get("path") or "").strip()
+        if path:
+            return self.artifacts.get_by_path(path)
+
+        reference = str(args.get("reference") or "").strip()
+        if reference:
+            artifact, _matches, _reason = self.artifacts.resolve_reference(reference)
+            if artifact:
+                return artifact
+
+        context_artifact_id = str(self._runtime_context_for(run).get("last_artifact_id") or "").strip()
+        if context_artifact_id:
+            return self.artifacts.get(context_artifact_id)
+        return None
+
+    def _record_download_artifact(
+        self,
+        run: AutomationRun,
+        path: str | Path,
+        source_url: str = "",
+        title: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> AutomationArtifact:
+        artifact = self.artifacts.record_download(path, run.id, source_url=source_url, title=title, metadata=metadata)
+        self._runtime_context_for(run)["last_artifact_id"] = artifact.id
+        self._sync_runtime_context_to_run(run)
+        self._append_event(
+            run,
+            "artifact_recorded",
+            f"Remembered {artifact.filename} for future tasks.",
+            {"artifact": artifact.model_dump(mode="json"), "artifact_id": artifact.id, "filename": artifact.filename, "path": artifact.path},
+        )
+        return artifact
+
     def _latest_download_file(self, run_download_dir: Path, before_files: set[Path]) -> Path:
         candidates = [
             path.resolve()
@@ -1349,50 +2310,27 @@ class AutomationService:
 
     def _requires_confirmation(self, run: AutomationRun, step: dict[str, Any]) -> bool:
         tool = step["tool"]
-        if tool in {"browser.download", "python.run_safe", "video.download_permitted"}:
+        if tool in {"browser.download", "python.run_safe"}:
             return True
+        if tool == "desktop.press_key":
+            key = str(step.get("args", {}).get("key") or "").strip().lower()
+            if key == "enter" and re.search(r"\b(send|submit|post|publish|message|email|dm|text)\b", run.prompt, re.IGNORECASE):
+                return True
         host = urlparse(run.current_url).netloc.lower()
         if any(host.endswith(private_host) for private_host in PRIVATE_HOSTS) and tool in {"browser.click", "browser.type", "browser.extract"}:
             return True
         return False
 
     async def _confirmation_payload(self, run: AutomationRun, step: dict[str, Any]) -> dict[str, Any]:
-        if step["tool"] == "video.download_permitted":
-            return await self._video_download_confirmation_payload(run, step)
         return {"step": step, "message": self._confirmation_message(step)}
-
-    async def _video_download_confirmation_payload(self, run: AutomationRun, step: dict[str, Any]) -> dict[str, Any]:
-        page = await self._ensure_page()
-        video_url = str(step.get("args", {}).get("url") or run.current_url or page.url).strip()
-        title = ""
-        channel = ""
-        try:
-            title = (await page.title()).replace(" - YouTube", "").strip()
-        except Exception:
-            title = ""
-        try:
-            channel = (await page.locator("ytd-video-owner-renderer #channel-name a").first.inner_text(timeout=2000)).strip()
-        except Exception:
-            channel = ""
-        rights_statement = "I own this video or have permission/license to download it."
-        return {
-            "kind": "video_download_permission",
-            "step": step,
-            "message": "Astra needs your rights confirmation before downloading this video.",
-            "video_url": video_url,
-            "video_title": title,
-            "channel": channel,
-            "rights_statement": rights_statement,
-            "max_size_mb": VIDEO_DOWNLOAD_MAX_SIZE_MB,
-        }
 
     def _confirmation_message(self, step: dict[str, Any]) -> str:
         if step["tool"] == "python.run_safe":
             return "Astra needs approval before running Python for this automation."
-        if step["tool"] == "video.download_permitted":
-            return "Astra needs your rights confirmation before downloading this video."
         if step["tool"] == "browser.download":
             return "Astra needs approval before downloading a file."
+        if step["tool"] == "desktop.press_key":
+            return "Astra needs approval before sending or submitting this desktop action."
         return f"Astra needs approval before: {step['description']}"
 
     def _set_status(self, run: AutomationRun, status: str) -> None:
@@ -1411,6 +2349,7 @@ class AutomationService:
         return self.runs_dir / f"{run_id}.json"
 
     def _save_run(self, run: AutomationRun) -> None:
+        self._sync_runtime_context_to_run(run)
         self.runs[run.id] = run
         self._run_path(run.id).write_text(run.model_dump_json(indent=2), encoding="utf-8")
 

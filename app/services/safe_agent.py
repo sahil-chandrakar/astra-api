@@ -37,7 +37,7 @@ from app.services.agent_intent import AgentIntentParser
 from app.services.desktop import SAFE_TARGETS, DesktopActionService, DesktopTarget
 from app.services.documents import DocumentService
 from app.services.memory import MemoryService
-from app.services.mock_tests import MockTestService, MockTestSourceMaterialError
+from app.services.mock_tests import MOCK_TEST_GENERATION_TIMEOUT_SECONDS, MockTestService, MockTestSourceMaterialError
 from app.services.reports import ReportService
 from app.services.study import StudyService
 from app.services.voice import VoiceService
@@ -193,9 +193,19 @@ class SafeAgentService:
         if unsafe:
             return unsafe
 
+        local_drive = self._resolve_local_drive_request(text, normalized, confirmed)
+        if local_drive:
+            return local_drive
+
+        local_desktop = self._resolve_allowlisted_desktop_request(text, normalized, confirmed, source="exact")
+        if local_desktop:
+            return local_desktop
+
         semantic = await self.intent_parser.resolve(text, normalized, confirmed, set(self.commands))
         if semantic:
-            return semantic
+            semantic = self._repair_semantic_request(semantic, text, normalized, confirmed)
+            if semantic:
+                return semantic
 
         request = self.request_from_text(text, confirmed=confirmed)
         if request:
@@ -288,7 +298,7 @@ class SafeAgentService:
         )
 
     async def _resolve_with_llm(self, text: str, normalized: str, confirmed: bool) -> AgentCommandRequest | None:
-        if not self.settings.has_cerebras:
+        if not self.llm.model_configured():
             return None
 
         candidates = self._llm_candidates()
@@ -425,6 +435,51 @@ class SafeAgentService:
             confirmed=confirmed,
             resolution=resolution,
         )
+
+    def _resolve_allowlisted_desktop_request(self, text: str, normalized: str, confirmed: bool, source: str) -> AgentCommandRequest | None:
+        target = self.desktop.detect(text)
+        if not target:
+            return None
+        target_key = self._safe_target_key_for_target(target)
+        if not target_key:
+            return None
+        resolution = self._resolution_meta(source, 1.0, target.label, normalized)
+        return AgentCommandRequest(
+            command_id="open_allowlisted_target",
+            input_text=text,
+            params={"target": target_key},
+            confirmed=confirmed,
+            resolution=resolution,
+        )
+
+    def _repair_semantic_request(
+        self,
+        request: AgentCommandRequest,
+        text: str,
+        normalized: str,
+        confirmed: bool,
+    ) -> AgentCommandRequest | None:
+        if request.command_id != "open_allowlisted_target":
+            return request
+
+        params = dict(request.params or {})
+        target_key = self._coerce_safe_target_key(params.get("target"))
+        if target_key:
+            params["target"] = target_key
+            return request.model_copy(update={"params": params})
+
+        if params.get("target"):
+            return request
+
+        repaired = self._resolve_allowlisted_desktop_request(text, normalized, confirmed, source="semantic_local")
+        if not repaired:
+            return None
+
+        resolution = dict(repaired.resolution)
+        resolution["semantic_repair"] = True
+        if request.resolution:
+            resolution["semantic_resolution"] = dict(request.resolution)
+        return repaired.model_copy(update={"resolution": resolution})
 
     def _best_intent_match(self, normalized: str) -> IntentMatch | None:
         scores: list[tuple[int, IntentCandidate, str]] = []
@@ -1417,7 +1472,17 @@ class SafeAgentService:
             constraints=params.get("constraints", []),
         )
         try:
-            test, setup = await self.mock_tests.generate(request)
+            test, setup = await asyncio.wait_for(
+                self.mock_tests.generate(request),
+                timeout=MOCK_TEST_GENERATION_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            model = self.llm.model_for_profile("pro")
+            return (
+                False,
+                f"Mock-test generation is taking too long with {model}. Try fewer questions, a faster model, or Cerebras for this run.",
+                {"setup_required": [], "model": model, "timeout_seconds": MOCK_TEST_GENERATION_TIMEOUT_SECONDS},
+            )
         except MockTestSourceMaterialError as exc:
             return False, str(exc), {"setup_required": [], "source_actions": exc.source_actions}
         except ValueError as exc:
@@ -1516,8 +1581,10 @@ class SafeAgentService:
                 return clean, f"Missing required parameter: {key}."
 
         if command.id == "open_allowlisted_target":
-            if clean.get("target") not in self.safe_targets:
+            target_key = self._coerce_safe_target_key(clean.get("target"))
+            if not target_key:
                 return clean, "That target is not approved for automatic opening."
+            clean["target"] = target_key
             if "drive" in clean and clean.get("drive") not in {None, ""}:
                 if clean.get("target") != "file_explorer":
                     return clean, "Local drive selection is only allowed with File Explorer."
@@ -1848,6 +1915,28 @@ class SafeAgentService:
     def _detect_allowed_target(self, normalized: str) -> str | None:
         for key, target in self.safe_targets.items():
             if any(alias in normalized for alias in target.aliases):
+                return key
+        return None
+
+    def _safe_target_key_for_target(self, target: DesktopTarget) -> str | None:
+        for key, safe_target in self.safe_targets.items():
+            if safe_target == target or safe_target.label == target.label:
+                return key
+        return None
+
+    def _coerce_safe_target_key(self, value: Any) -> str | None:
+        normalized = self._normalize(str(value or ""))
+        if not normalized:
+            return None
+
+        candidate_key = normalized.replace("-", "_").replace(" ", "_")
+        if candidate_key in self.safe_targets:
+            return candidate_key
+
+        compact = self._compact(normalized)
+        for key, target in self.safe_targets.items():
+            aliases = {key, target.label, *target.aliases}
+            if compact in {self._compact(alias) for alias in aliases}:
                 return key
         return None
 

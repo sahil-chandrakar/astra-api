@@ -24,38 +24,22 @@ CEREBRAS_PRO_MODELS = [
     "qwen-3-235b-a22b-instruct-2507",
 ]
 
+# NVIDIA Build catalog "Free Endpoint" chat models, checked May 21, 2026.
+# Only chat-completions compatible models are exposed here; media, embedding,
+# rerank, TTS, safety, and smoke-test failing endpoints are intentionally hidden.
 NVIDIA_FAST_MODELS = [
-    "openai/gpt-oss-20b",
-    "deepseek-ai/deepseek-v4-flash",
-    "nvidia/nvidia-nemotron-nano-9b-v2",
-    "nvidia/nemotron-3-nano-30b-a3b",
-    "microsoft/phi-4-mini-flash-reasoning",
-    "microsoft/phi-4-mini-instruct",
-    "meta/llama-3.1-8b-instruct",
-    "meta/llama-3.2-3b-instruct",
-    "mistralai/mistral-7b-instruct-v0.3",
-    "qwen/qwen2.5-coder-32b-instruct",
-    "stepfun-ai/step-3-5-flash",
+    "google/gemma-3n-e2b-it",
+    "google/gemma-3n-e4b-it",
+    "microsoft/phi-4-multimodal-instruct",
+    "abacusai/dracarys-llama-3.1-70b-instruct",
 ]
 
 NVIDIA_PRO_MODELS = [
-    "moonshotai/kimi-k2.6",
-    "z-ai/glm5.1",
-    "z-ai/glm4.7",
-    "deepseek-ai/deepseek-v4-pro",
-    "openai/gpt-oss-120b",
     "qwen/qwen3-coder-480b-a35b-instruct",
-    "qwen/qwen3-next-80b-a3b-thinking",
-    "qwen/qwen3-5-122b-a10b",
-    "nvidia/nemotron-3-super-120b-a12b",
-    "nvidia/llama-3.1-nemotron-ultra-253b-v1",
-    "nvidia/llama-3.3-nemotron-super-49b-v1.5",
-    "minimaxai/minimax-m2.7",
-    "moonshotai/kimi-k2-thinking",
-    "moonshotai/kimi-k2-instruct",
-    "mistralai/mistral-nemotron",
-    "mistralai/mixtral-8x22b-instruct",
+    "meta/llama-4-maverick-17b-128e-instruct",
 ]
+
+NVIDIA_FREE_CHAT_MODEL_IDS = frozenset([*NVIDIA_FAST_MODELS, *NVIDIA_PRO_MODELS])
 
 
 class LlmService:
@@ -82,6 +66,20 @@ class LlmService:
     def provider_configured(self, provider: str) -> bool:
         return self._provider_configured(provider)
 
+    def provider_for_model(self, model: str | None = None) -> str:
+        provider, _ = self._resolve_model(model)
+        return provider
+
+    def model_configured(self, model: str | None = None) -> bool:
+        provider, _ = self._resolve_model(model)
+        return self._provider_configured(provider)
+
+    def missing_setup_for_model(self, model: str | None = None) -> str:
+        provider, _ = self._resolve_model(model)
+        if provider == "nvidia":
+            return "NVIDIA_API_KEY"
+        return "CEREBRAS_API_KEY"
+
     def settings_response(self) -> LlmSettingsResponse:
         return LlmSettingsResponse(profiles=self.current_profiles(), providers=self.provider_statuses())
 
@@ -107,8 +105,12 @@ class LlmService:
                 continue
             provider = str(item.get("provider") or "").strip().lower()
             model = str(item.get("model") or "").strip()
-            if model in self._models_for_profile(provider, profile_name):
-                defaults[profile_name] = LlmProfileConfig(provider=provider, model=model)  # type: ignore[arg-type]
+            allowed_models = self._models_for_profile(provider, profile_name)
+            if allowed_models:
+                defaults[profile_name] = LlmProfileConfig(
+                    provider=provider,  # type: ignore[arg-type]
+                    model=model if model in allowed_models else allowed_models[0],
+                )
         return defaults
 
     def provider_statuses(self) -> list[LlmProviderStatus]:
@@ -171,6 +173,8 @@ class LlmService:
         if not self.settings.has_nvidia:
             return self._fallback_answer(user_prompt, "nvidia", selected_model), ["NVIDIA_API_KEY"]
 
+        prompt_text = f"{system_prompt}\n{user_prompt}".lower()
+        strict_json_task = "strict json" in prompt_text or "json only" in prompt_text
         payload: dict[str, Any] = {
             "model": selected_model,
             "messages": [
@@ -183,7 +187,7 @@ class LlmService:
             "stream": False,
         }
         if selected_model.startswith("moonshotai/kimi"):
-            payload["chat_template_kwargs"] = {"thinking": True}
+            payload["chat_template_kwargs"] = {"thinking": not strict_json_task}
 
         headers = {
             "Authorization": f"Bearer {self.settings.nvidia_api_key}",
@@ -192,18 +196,20 @@ class LlmService:
         }
         url = f"{self.settings.nvidia_base_url.rstrip('/')}/chat/completions"
         last_error: Exception | None = None
-        for attempt in range(3):
+        attempt_count = 1 if strict_json_task else 3
+        request_timeout = 45 if strict_json_task else 90
+        for attempt in range(attempt_count):
             try:
                 import httpx
 
-                async with httpx.AsyncClient(timeout=90) as client:
+                async with httpx.AsyncClient(timeout=request_timeout) as client:
                     response = await client.post(url, headers=headers, json=payload)
                     response.raise_for_status()
                     data = response.json()
                 return self._content_from_chat_completion(data), []
             except Exception as exc:
                 last_error = exc
-                if attempt < 2:
+                if attempt < attempt_count - 1:
                     await asyncio.sleep(0.6 * (attempt + 1))
 
         return (
@@ -251,7 +257,11 @@ class LlmService:
         return self._dedupe_models([*NVIDIA_FAST_MODELS])
 
     def _nvidia_pro_models(self) -> list[str]:
-        return self._dedupe_models([self.settings.nvidia_model, *NVIDIA_PRO_MODELS])
+        configured = self.settings.nvidia_model.strip()
+        models = [*NVIDIA_PRO_MODELS]
+        if configured in NVIDIA_FREE_CHAT_MODEL_IDS:
+            models.insert(0, configured)
+        return self._dedupe_models(models)
 
     def _models_for_profile(self, provider: str, profile_name: str) -> list[str]:
         provider = provider.strip().lower()

@@ -29,7 +29,7 @@ class AgentIntentParser:
     ) -> AgentCommandRequest | None:
         if not self._can_be_semantic_agent_intent(normalized):
             return None
-        if self.settings.has_cerebras:
+        if self.llm.model_configured():
             llm_request = await self._resolve_with_llm(text, normalized, confirmed, allowed_command_ids)
             if llm_request:
                 return llm_request
@@ -73,6 +73,8 @@ class AgentIntentParser:
                     "source_requirement": "none|pyq_required|source_backed",
                     "source_mode": "uploaded_docs",
                     "source_query": "string",
+                    "target": "approved target key for open_allowlisted_target, such as calculator",
+                    "params": {"target": "approved target key"},
                     "is_new_creation": "boolean",
                     "is_existing_item_request": "boolean",
                     "needs_clarification": "boolean",
@@ -141,6 +143,8 @@ class AgentIntentParser:
         params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
         if command_id == "generate_mock_test":
             params = self._mock_params(text, normalized, payload)
+        elif command_id == "open_allowlisted_target" and payload.get("target") and "target" not in params:
+            params = {**params, "target": str(payload.get("target") or "").strip()}
 
         resolution = self._resolution("llm", confidence, str(payload.get("matched_alias") or payload.get("reason") or command_id), normalized)
         resolution["intent"] = str(payload.get("intent") or command_id)[:80]

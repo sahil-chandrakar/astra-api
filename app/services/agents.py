@@ -1,3 +1,4 @@
+import asyncio
 import re
 
 from app.config import Settings
@@ -17,6 +18,9 @@ AGENTS = [
     AgentDescriptor(name="Writer Agent", role="Produces the final answer for Astra."),
     AgentDescriptor(name="Voice Agent", role="Coordinates listening, speech, and voice state."),
 ]
+
+CHAT_LLM_TIMEOUT_SECONDS = 12
+CHAT_LLM_FALLBACK_TIMEOUT_SECONDS = 8
 
 
 class AstraAgentSystem:
@@ -50,11 +54,26 @@ class AstraAgentSystem:
                 "Do not claim that desktop or file actions happened unless a tool result says they happened. "
                 "For unsupported actions, briefly explain that Astra can only execute allowlisted safe commands."
             )
-        answer, setup = await self.llm.complete(
-            system_prompt,
-            message,
-            model=model,
-        )
+        try:
+            answer, setup = await asyncio.wait_for(
+                self.llm.complete(system_prompt, message, model=model),
+                timeout=CHAT_LLM_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            fallback_model = model_selector("fast") if callable(model_selector) else self.settings.resolved_cerebras_fast_model
+            if mode != "agents" and fallback_model != model:
+                try:
+                    answer, setup = await asyncio.wait_for(
+                        self.llm.complete(system_prompt, message, model=fallback_model),
+                        timeout=CHAT_LLM_FALLBACK_TIMEOUT_SECONDS,
+                    )
+                    setup = [*setup, "LLM_PRO_TIMEOUT_FALLBACK"]
+                except asyncio.TimeoutError:
+                    answer = "The selected AI model is taking too long. I stayed responsive, but the model did not finish in time."
+                    setup = ["LLM_TIMEOUT"]
+            else:
+                answer = "The selected AI model is taking too long. Try the Fast model or switch to a lower-latency provider."
+                setup = ["LLM_TIMEOUT"]
         if mode == "agents":
             answer = self._clean_agent_chat_answer(answer)
         events.append(AgentEvent(agent="Writer Agent", status="complete", message="Response ready."))

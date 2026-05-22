@@ -29,12 +29,14 @@ from app.models import (
     VoiceTranscriptionResponse,
 )
 from app.services.agents import AstraAgentSystem
+from app.services.agent_runtime import AgentRuntime
+from app.services.artifacts import ArtifactService
 from app.services.automations import AutomationService
 from app.services.commands import CommandService
 from app.services.desktop import DesktopActionService
 from app.services.documents import DocumentService
 from app.services.memory import MemoryService
-from app.services.mock_tests import MockTestService
+from app.services.mock_tests import MOCK_TEST_GENERATION_TIMEOUT_SECONDS, MockTestService
 from app.services.reports import ReportService
 from app.services.research import ResearchService
 from app.services.safe_agent import SafeAgentService
@@ -53,8 +55,10 @@ document_service = DocumentService(settings)
 study_service = StudyService(settings, report_service, document_service, agent_system.llm)
 mock_test_service = MockTestService(settings, agent_system.llm, document_service, agent_system.search)
 safe_agent_service = SafeAgentService(settings, report_service, memory_service, document_service, study_service, mock_test_service, desktop_service, voice_service)
-automation_service = AutomationService(settings, agent_system.llm)
-command_service = CommandService(agent_system, desktop_service, report_service, safe_agent_service, research_service)
+artifact_service = ArtifactService(settings)
+agent_runtime = AgentRuntime(settings, agent_system.llm, artifact_service)
+automation_service = AutomationService(settings, agent_system.llm, artifact_service, agent_runtime)
+command_service = CommandService(agent_system, desktop_service, report_service, safe_agent_service, research_service, automation_service)
 
 app = FastAPI(title="Astra AI Agent API", version="0.1.0")
 
@@ -230,9 +234,17 @@ async def automation_recipes():
     return automation_service.list_recipes()
 
 
+@app.get("/api/automations/engines/status")
+async def automation_engine_statuses():
+    return automation_service.engine_statuses()
+
+
 @app.post("/api/automations/recipes")
 async def create_automation_recipe(request: AutomationRecipeCreateRequest):
-    return automation_service.create_recipe(request)
+    try:
+        return automation_service.create_recipe(request)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.delete("/api/automations/recipes/{recipe_id}")
@@ -303,7 +315,18 @@ async def study_artifacts():
 @app.post("/api/mock-tests/generate")
 async def generate_mock_test(request: MockTestGenerateRequest):
     try:
-        test, setup = await mock_test_service.generate(request)
+        test, setup = await asyncio.wait_for(
+            mock_test_service.generate(request),
+            timeout=MOCK_TEST_GENERATION_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                "Mock-test generation is taking too long with the selected LLM provider. "
+                "Try fewer questions, a faster model, or switch providers for this run."
+            ),
+        ) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"test": test, "setup_required": setup}

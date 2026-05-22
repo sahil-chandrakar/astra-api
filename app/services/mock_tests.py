@@ -26,6 +26,9 @@ from app.services.mock_intelligence import MockBlueprint, MockTestIntelligenceSe
 from app.services.search import SearchService
 
 
+MOCK_TEST_GENERATION_TIMEOUT_SECONDS = 75
+
+
 class MockTestSourceMaterialError(ValueError):
     def __init__(self, message: str, source_actions: list[str]):
         super().__init__(message)
@@ -62,6 +65,7 @@ class MockTestService:
 
     async def generate(self, request: MockTestGenerateRequest) -> tuple[MockTestView, list[str]]:
         clean = self._clean_request(request)
+        llm_configured = self.llm.model_configured()
         setup_required: list[str] = []
         questions: list[MockQuestion] = []
         source = "llm"
@@ -100,8 +104,9 @@ class MockTestService:
                     "I found links or snippets, but not enough actual PYQ question text to make a verified test. Upload a clearer PYQ PDF or switch to PYQ-style practice.",
                     self._source_failure_actions(clean),
                 )
-            if not self.settings.has_cerebras:
-                raise ValueError("Source-backed mock tests found source material, but CEREBRAS_API_KEY is required to convert it into verified questions.")
+            if not llm_configured:
+                missing_setup = self.llm.missing_setup_for_model()
+                raise ValueError(f"Source-backed mock tests found source material, but {missing_setup} is required to convert it into verified questions.")
             raw, llm_setup = await self.llm.complete(self._source_system_prompt(clean), self._source_user_prompt(clean, source_material, source_refs))
             setup_required.extend(llm_setup)
             questions = self._questions_from_llm(raw, clean, default_sources=source_refs[:3])
@@ -124,7 +129,7 @@ class MockTestService:
             source_refs = self._dedupe_sources([*source_refs, *blueprint.sources])
             source = blueprint.generation_mode
 
-            if self.settings.has_cerebras:
+            if llm_configured:
                 candidate_questions: list[MockQuestion] = []
                 best_accepted: list[MockQuestion] = []
                 rejected_reasons: list[str] = []
@@ -143,6 +148,9 @@ class MockTestService:
                         ),
                     )
                     setup_required.extend(llm_setup)
+                    if any(item in {"CEREBRAS_API", "CEREBRAS_SDK", "NVIDIA_API"} for item in llm_setup):
+                        rejected_reasons = [f"LLM provider failed: {', '.join(llm_setup)}"]
+                        break
                     new_questions = self._questions_from_llm(raw, clean, max_questions=candidate_count)
                     candidate_questions = self._dedupe_questions([*candidate_questions, *new_questions])
                     accepted, score, warnings = self.intelligence.validator.validate(
@@ -203,7 +211,7 @@ class MockTestService:
             if len(questions) < clean.question_count:
                 warning_text = " ".join(quality_warnings[:2])
                 detail = f" {warning_text}" if warning_text else ""
-                setup = sorted(set(setup_required or ([] if self.settings.has_cerebras else ["CEREBRAS_API_KEY"])))
+                setup = sorted(set(setup_required or ([] if llm_configured else [self.llm.missing_setup_for_model()])))
                 setup_label = f" Missing setup: {', '.join(setup)}." if setup else ""
                 raise ValueError(
                     f"Astra could not create enough exam-quality MCQs for {clean.topic} without falling back to generic filler.{detail}{setup_label}"
@@ -213,7 +221,7 @@ class MockTestService:
             setup_required = [
                 item
                 for item in setup_required
-                if item not in {"CEREBRAS_API", "CEREBRAS_SDK", "CEREBRAS_API_KEY", "TAVILY_API_KEY"}
+                if item not in {"CEREBRAS_API", "CEREBRAS_SDK", "CEREBRAS_API_KEY", "NVIDIA_API", "NVIDIA_API_KEY", "TAVILY_API_KEY"}
             ]
 
         test = MockTest(
@@ -473,8 +481,8 @@ class MockTestService:
 
     def _candidate_count(self, requested_count: int, attempt: int, remaining_count: int | None = None) -> int:
         remaining = max(1, remaining_count or requested_count)
-        extra = 3 if attempt == 0 else 5
-        return min(8, max(4, remaining + extra))
+        extra = 4 if attempt == 0 else 6
+        return min(16, max(4, remaining + extra))
 
     async def _single_question_rescue(
         self,
@@ -504,6 +512,9 @@ class MockTestService:
                 ),
             )
             setup_required.extend(llm_setup)
+            if any(item in {"CEREBRAS_API", "CEREBRAS_SDK", "NVIDIA_API"} for item in llm_setup):
+                warnings = [f"LLM provider failed: {', '.join(llm_setup)}"]
+                break
             new_questions = self._questions_from_llm(raw, request, max_questions=1)
             if new_questions:
                 all_candidates = self._dedupe_questions([*all_candidates, *new_questions])

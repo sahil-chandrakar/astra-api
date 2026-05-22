@@ -13,6 +13,11 @@ AgentCommandRisk = Literal["safe_auto", "safe_confirm", "blocked"]
 AgentCommandTestStatus = Literal["untested", "passed", "failed"]
 AgentCommandOutcome = Literal["success", "failure", "blocked", "confirmation_required", "planned"]
 AutomationRunStatus = Literal["queued", "planning", "running", "waiting_for_login", "waiting_for_user", "confirmation_required", "complete", "error", "cancelled"]
+AutomationRecipeStatus = Literal["draft", "executable", "needs_tools"]
+AutomationEngine = Literal["astra", "openrpa"]
+AutomationWorkflowRefType = Literal["id", "filename"]
+AutomationArtifactKind = Literal["download", "report", "document", "generated", "opened_resource"]
+AutomationArtifactMediaType = Literal["video", "audio", "image", "document", "archive", "text", "unknown"]
 AgentMemoryCategory = Literal["course", "project", "goal", "preference", "general"]
 StudyArtifactType = Literal["notes", "flashcards", "quiz", "revision_plan", "viva_questions"]
 MockTestDifficulty = Literal["easy", "medium", "hard", "mixed"]
@@ -147,7 +152,7 @@ class CommandRequest(BaseModel):
 
 class CommandResponse(BaseModel):
     mode: AppMode
-    intent: Literal["chat", "research", "desktop_action", "mode_switch", "agent_plan", "agent_command"]
+    intent: Literal["chat", "research", "desktop_action", "mode_switch", "agent_plan", "agent_command", "automation_suggestion"]
     spoken_text: str
     display_text: str
     events: list[AgentEvent] = Field(default_factory=list)
@@ -159,6 +164,8 @@ class CommandResponse(BaseModel):
     action_result: ActionResult | None = None
     suggested_mode: AppMode | None = None
     agent_command: "AgentCommandResponse | None" = None
+    automation_run: "AutomationRun | None" = None
+    automation_suggestion: "AutomationSuggestion | None" = None
 
 
 class AgentDescriptor(BaseModel):
@@ -231,12 +238,28 @@ class AutomationEvent(BaseModel):
     data: dict[str, Any] = Field(default_factory=dict)
 
 
+class AutomationArtifact(BaseModel):
+    id: str
+    kind: AutomationArtifactKind = "download"
+    media_type: AutomationArtifactMediaType = "unknown"
+    title: str = ""
+    filename: str
+    path: str
+    source_url: str = ""
+    run_id: str = ""
+    size_bytes: int = 0
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
 class AutomationRun(BaseModel):
     id: str
     prompt: str
     status: AutomationRunStatus = "queued"
     current_url: str = ""
     events: list[AutomationEvent] = Field(default_factory=list)
+    agent_state: dict[str, Any] = Field(default_factory=dict)
     result: str = ""
     error: str = ""
     recipe_id: str | None = None
@@ -250,25 +273,66 @@ class AutomationRecipe(BaseModel):
     id: str
     name: str
     prompt: str
+    engine: AutomationEngine = "astra"
     steps: list[dict[str, Any]] = Field(default_factory=list)
+    inputs: list[str] = Field(default_factory=list)
+    risk: AgentCommandRisk = "safe_auto"
+    status: AutomationRecipeStatus = "executable"
+    missing_tools: list[str] = Field(default_factory=list)
+    validation_errors: list[str] = Field(default_factory=list)
+    built_from: str = ""
+    workflow_ref: str = ""
+    workflow_ref_type: AutomationWorkflowRefType = "id"
+    aliases: list[str] = Field(default_factory=list)
+    timeout_seconds: int = Field(default=300, ge=1, le=86400)
+    description: str = ""
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class AutomationEngineStatus(BaseModel):
+    id: AutomationEngine
+    label: str
+    installed: bool
+    configured_path: str = ""
+    message: str = ""
+
+
+class AutomationSuggestion(BaseModel):
+    recipe: AutomationRecipe
+    message: str
+    inputs: list[str] = Field(default_factory=list)
+    risk: AgentCommandRisk = "safe_auto"
 
 
 class AutomationRunRequest(BaseModel):
     prompt: str = Field(..., min_length=1)
     recipe_id: str | None = None
     create_recipe: bool = False
+    inputs: dict[str, Any] = Field(default_factory=dict)
 
 
 class AutomationRecipeCreateRequest(BaseModel):
     name: str = Field(..., min_length=1)
     prompt: str = Field(..., min_length=1)
+    engine: AutomationEngine = "astra"
     steps: list[dict[str, Any]] = Field(default_factory=list)
+    inputs: list[str] = Field(default_factory=list)
+    risk: AgentCommandRisk = "safe_auto"
+    status: AutomationRecipeStatus = "executable"
+    missing_tools: list[str] = Field(default_factory=list)
+    validation_errors: list[str] = Field(default_factory=list)
+    built_from: str = ""
+    workflow_ref: str = ""
+    workflow_ref_type: AutomationWorkflowRefType = "id"
+    aliases: list[str] = Field(default_factory=list)
+    timeout_seconds: int = Field(default=300, ge=1, le=86400)
+    description: str = ""
 
 
 class AutomationContinueRequest(BaseModel):
     note: str = ""
+    selected_artifact_id: str | None = None
 
 
 class AutomationCancelRequest(BaseModel):
