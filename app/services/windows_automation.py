@@ -36,6 +36,8 @@ class WindowsAutomationService:
 
         data["expression"] = expression
         time.sleep(0.8)
+        self._focus_window_by_title("Calculator", timeout=5)
+        time.sleep(0.2)
         typed = self._send_keys_to_active_window(self._calculator_send_keys(expression))
         if typed:
             return WindowsAutomationResult(True, "calculator", f"Opened Calculator and typed {expression}.", data)
@@ -142,8 +144,27 @@ class WindowsAutomationService:
                     {"app": "WhatsApp", "contact": clean_contact},
                 )
 
-            message_box_ready = self._focus_whatsapp_message_box()
-            self._send_text_to_active_control(clean_message, replace=False)
+            if not self._focus_whatsapp_message_box():
+                return WindowsAutomationResult(
+                    False,
+                    "windows_error",
+                    f"Opened WhatsApp chat for {clean_contact}, but could not focus the message box.",
+                    {"app": "WhatsApp", "contact": clean_contact, "message_length": len(clean_message), "message_box_detected": False},
+                )
+            self._send_text_to_active_control(clean_message, replace=True)
+            time.sleep(0.35)
+            if not self._focused_edit_contains(clean_message):
+                self._focus_window_by_title("WhatsApp", timeout=2)
+                self._focus_whatsapp_message_box()
+                self._send_text_to_active_control(clean_message, replace=True)
+                time.sleep(0.35)
+                if not self._focused_edit_contains(clean_message):
+                    return WindowsAutomationResult(
+                        False,
+                        "windows_error",
+                        f"WhatsApp message box did not contain the draft for {clean_contact}.",
+                        {"app": "WhatsApp", "contact": clean_contact, "message_length": len(clean_message), "message_box_detected": True},
+                    )
         except Exception as exc:
             return WindowsAutomationResult(
                 False,
@@ -160,9 +181,42 @@ class WindowsAutomationService:
                 "app": "WhatsApp",
                 "contact": clean_contact,
                 "message_length": len(clean_message),
-                "message_box_detected": message_box_ready,
+                "message_box_detected": True,
             },
         )
+
+    def send_prepared_whatsapp_message(self, contact: str = "", expected_message: str = "") -> WindowsAutomationResult:
+        if not self.is_supported():
+            return self._unsupported("WhatsApp")
+
+        clean_contact = re.sub(r"\s+", " ", contact or "").strip()
+        clean_message = str(expected_message or "").strip()
+        data = {
+            "app": "WhatsApp",
+            "contact": clean_contact,
+            "message_length": len(clean_message),
+        }
+        try:
+            if not self._focus_window_by_title("WhatsApp", timeout=5):
+                return WindowsAutomationResult(False, "windows_error", "Astra could not focus WhatsApp before sending.", data)
+            if not self._focus_whatsapp_message_box():
+                return WindowsAutomationResult(False, "windows_error", "Astra could not focus the WhatsApp message box before sending.", data)
+            if clean_message and not self._focused_edit_contains(clean_message):
+                return WindowsAutomationResult(
+                    False,
+                    "windows_error",
+                    "Astra stopped before sending because the WhatsApp draft did not match the prepared message.",
+                    {**data, "draft_mismatch": True},
+                )
+
+            from pywinauto.keyboard import send_keys
+
+            send_keys("{ENTER}", pause=0.03)
+            time.sleep(0.45)
+        except Exception as exc:
+            return WindowsAutomationResult(False, "windows_error", f"Could not send the prepared WhatsApp message: {exc}", data)
+
+        return WindowsAutomationResult(True, "whatsapp_sent", "Sent the prepared WhatsApp message.", data)
 
     def find_text(
         self,
@@ -247,8 +301,15 @@ class WindowsAutomationService:
             return WindowsAutomationResult(False, "windows_error", f"Could not press {normalized}: {exc}", {"key": normalized})
         return WindowsAutomationResult(True, "desktop_key_pressed", f"Pressed {normalized}.", {"key": normalized})
 
-    def verify_text(self, text: str, app_name: str = "", timeout: int = 6) -> WindowsAutomationResult:
-        result = self.find_text(text, app_name=app_name, timeout=timeout)
+    def verify_text(
+        self,
+        text: str,
+        app_name: str = "",
+        timeout: int = 6,
+        control_types: list[str] | None = None,
+        exclude_control_types: list[str] | None = None,
+    ) -> WindowsAutomationResult:
+        result = self.find_text(text, app_name=app_name, timeout=timeout, control_types=control_types or [], exclude_control_types=exclude_control_types or [])
         if result.ok:
             return WindowsAutomationResult(True, "desktop_verified", f"Verified '{text}' is visible.", result.data)
         return WindowsAutomationResult(False, "desktop_verify_failed", f"Could not verify '{text}' is visible.", result.data)
@@ -410,38 +471,46 @@ class WindowsAutomationService:
                     title = (window.window_text() or "").lower()
                     if fragment not in title and title not in fragment:
                         continue
+                    hwnd = self._window_handle(window)
+                    if hwnd:
+                        self._focus_window(hwnd)
+                    try:
+                        window.restore()
+                    except Exception:
+                        pass
                     try:
                         window.set_focus()
                     except Exception:
-                        hwnd = getattr(getattr(window, "element_info", None), "handle", None)
                         if hwnd:
-                            self._focus_window(int(hwnd))
+                            self._focus_window(hwnd)
                     time.sleep(0.25)
-                    return True
+                    if self._window_is_usable(window):
+                        return True
             except Exception:
                 return False
             time.sleep(0.25)
         return False
 
     def _open_whatsapp_chat(self, contact: str) -> bool:
-        if self._search_whatsapp_contact(contact, hotkey="f"):
+        if self._search_whatsapp_contact(contact):
             return True
         self._focus_window_by_title("WhatsApp", timeout=2)
-        return self._search_whatsapp_contact(contact, hotkey="n")
+        return self._search_whatsapp_contact(contact)
 
-    def _search_whatsapp_contact(self, contact: str, hotkey: str) -> bool:
+    def _search_whatsapp_contact(self, contact: str) -> bool:
         try:
-            from pywinauto.keyboard import send_keys
-
-            if hotkey == "f" and self._focus_whatsapp_search_box():
-                pass
-            else:
-                send_keys(f"^{hotkey}", pause=0.04)
-                time.sleep(0.45)
-            send_keys("^a{BACKSPACE}" + self._send_keys_literal(contact), pause=0.03, with_spaces=True)
-            time.sleep(0.9)
-            send_keys("{ENTER}", pause=0.05)
-            time.sleep(0.9)
+            if not self._focus_window_by_title("WhatsApp", timeout=3):
+                return False
+            if not self._click_whatsapp_region("search"):
+                return False
+            self._send_text_to_active_control(contact, replace=True)
+            time.sleep(1.15)
+            for _attempt in range(2):
+                if not self._focus_window_by_title("WhatsApp", timeout=2):
+                    return False
+                if not self._click_whatsapp_region("first_result"):
+                    return False
+                time.sleep(0.75)
             return self._focus_whatsapp_message_box()
         except Exception:
             return False
@@ -455,35 +524,112 @@ class WindowsAutomationService:
         )
         for label in labels:
             try:
-                target = self._find_text_target(label, "WhatsApp", 2, ["edit", "text"], [])
+                target = self._find_text_target(label, "WhatsApp", 2, ["edit"], [])
             except Exception:
                 target = None
             if self._click_desktop_target(target):
                 time.sleep(0.2)
                 return True
+        if self._click_desktop_target(self._find_whatsapp_edit_by_position("search")):
+            time.sleep(0.2)
+            return True
         return False
 
     def _focus_whatsapp_message_box(self) -> bool:
-        labels = (
-            "Type a message",
-            "Message",
-            "Type a message here",
-        )
-        for label in labels:
+        if not self._focus_window_by_title("WhatsApp", timeout=3):
+            return False
+        if self._click_whatsapp_region("composer"):
+            time.sleep(0.25)
+            return True
+        return False
+
+    def _click_whatsapp_region(self, region: str) -> bool:
+        rect = self._whatsapp_window_rect()
+        if not rect:
+            return False
+        left, top, right, bottom = rect
+        width = max(1, right - left)
+        height = max(1, bottom - top)
+        points = {
+            "search": (left + int(width * 0.26), top + int(height * 0.19)),
+            "first_result": (left + int(width * 0.25), top + int(height * 0.47)),
+            "composer": (left + int(width * 0.72), bottom - int(height * 0.065)),
+        }
+        point = points.get(region)
+        if not point:
+            return False
+        try:
+            self._focus_window_by_title("WhatsApp", timeout=2)
+            time.sleep(0.08)
+            self._click_screen_point(point[0], point[1])
+            return True
+        except Exception:
+            return False
+
+    def _whatsapp_window_rect(self) -> tuple[int, int, int, int] | None:
+        try:
+            from pywinauto import Desktop
+
+            desktop = Desktop(backend="uia")
+            for window in self._candidate_windows(desktop, "WhatsApp"):
+                rect = window.rectangle()
+                return (rect.left, rect.top, rect.right, rect.bottom)
+        except Exception:
+            return None
+        return None
+
+    def _focused_edit_contains(self, text: str) -> bool:
+        needle = re.sub(r"\s+", " ", text or "").strip().lower()
+        if not needle:
+            return False
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
             try:
-                target = self._find_text_target(label, "WhatsApp", 2, ["edit", "text"], [])
+                target = self._find_whatsapp_edit_by_position("message")
+                current = re.sub(r"\s+", " ", str((target or {}).get("text") or "")).strip().lower()
+                if needle in current:
+                    return True
             except Exception:
-                target = None
-            if self._click_desktop_target(target):
-                time.sleep(0.2)
-                return True
+                pass
+            time.sleep(0.2)
         return False
 
     def _send_text_to_active_control(self, text: str, replace: bool = False) -> None:
         from pywinauto.keyboard import send_keys
 
-        prefix = "^a{BACKSPACE}" if replace else ""
-        send_keys(prefix + self._send_keys_literal(text), pause=0.02, with_spaces=True)
+        if replace:
+            send_keys("^a{BACKSPACE}", pause=0.02)
+        if self._set_clipboard_text(text):
+            send_keys("^v", pause=0.03)
+            return
+        send_keys(self._send_keys_literal(text), pause=0.02, with_spaces=True)
+
+    def _set_clipboard_text(self, text: str) -> bool:
+        try:
+            import tkinter
+
+            root = tkinter.Tk()
+            root.withdraw()
+            root.clipboard_clear()
+            root.clipboard_append(text)
+            root.update()
+            root.destroy()
+            return True
+        except Exception:
+            pass
+        try:
+            command = "[Console]::InputEncoding=[Text.UTF8Encoding]::UTF8; $text=[Console]::In.ReadToEnd(); Set-Clipboard -Value $text"
+            subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+                input=text,
+                text=True,
+                timeout=5,
+                creationflags=subprocess.CREATE_NO_WINDOW if self.is_supported() else 0,
+                check=True,
+            )
+            return True
+        except Exception:
+            return False
 
     def _click_desktop_target(self, target: Any) -> bool:
         if not isinstance(target, dict):
@@ -496,6 +642,67 @@ class WindowsAutomationService:
             y = int((int(rect["top"]) + int(rect["bottom"])) / 2)
             self._click_screen_point(x, y)
             return True
+        except Exception:
+            return False
+
+    def _find_whatsapp_edit_by_position(self, role: str) -> dict[str, Any] | None:
+        try:
+            from pywinauto import Desktop
+
+            desktop = Desktop(backend="uia")
+            edits: list[dict[str, Any]] = []
+            for window in self._candidate_windows(desktop, "WhatsApp"):
+                try:
+                    descendants = window.descendants(control_type="Edit")
+                except Exception:
+                    descendants = []
+                for control in descendants:
+                    try:
+                        rect = control.rectangle()
+                        if rect.width() < 80 or rect.height() < 18:
+                            continue
+                        text = re.sub(r"\s+", " ", control.window_text() or "").strip()
+                        text_key = text.lower()
+                        if role == "message" and "search" in text_key:
+                            continue
+                        if role == "search" and ("message" in text_key or "type a message" in text_key):
+                            continue
+                        edits.append(
+                            {
+                                "text": text,
+                                "control_type": "Edit",
+                                "window_title": window.window_text() or "WhatsApp",
+                                "rect": {"left": rect.left, "top": rect.top, "right": rect.right, "bottom": rect.bottom},
+                            }
+                        )
+                    except Exception:
+                        continue
+            if not edits:
+                return None
+            return sorted(edits, key=lambda item: int(item["rect"]["top"]), reverse=(role == "message"))[0]
+        except Exception:
+            return None
+
+    def _window_handle(self, window: Any) -> int | None:
+        for attr in ("handle",):
+            try:
+                value = getattr(window, attr)
+                if value:
+                    return int(value)
+            except Exception:
+                pass
+        try:
+            value = getattr(getattr(window, "element_info", None), "handle", None)
+            if value:
+                return int(value)
+        except Exception:
+            pass
+        return None
+
+    def _window_is_usable(self, window: Any) -> bool:
+        try:
+            rect = window.rectangle()
+            return rect.width() > 200 and rect.height() > 200 and rect.left > -10000 and rect.top > -10000
         except Exception:
             return False
 
@@ -532,6 +739,8 @@ class WindowsAutomationService:
         for window in windows:
             try:
                 if not window.is_visible():
+                    continue
+                if not self._window_is_usable(window):
                     continue
                 visible.append(window)
             except Exception:

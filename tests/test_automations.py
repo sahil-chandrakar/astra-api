@@ -72,9 +72,18 @@ class FakeWindowsDesktop:
         self.calls.append(("prepare_whatsapp_message", f"{contact}:{message}"))
         return WindowsAutomationResult(True, "whatsapp_prepared", f"Prepared WhatsApp message to {contact}.", {"contact": contact, "message_length": len(message)})
 
-    def verify_text(self, text: str, app_name: str = "", timeout: int = 6):
+    def send_prepared_whatsapp_message(self, contact: str = "", expected_message: str = ""):
+        self.calls.append(("send_prepared_whatsapp_message", f"{contact}:{expected_message}"))
+        return WindowsAutomationResult(True, "whatsapp_sent", "Sent the prepared WhatsApp message.", {"contact": contact, "message_length": len(expected_message)})
+
+    def verify_text(self, text: str, app_name: str = "", timeout: int = 6, control_types=None, exclude_control_types=None):
         self.calls.append(("verify_text", text))
-        return WindowsAutomationResult(True, "desktop_verified", f"Verified '{text}' is visible.", {"text": text, "app": app_name})
+        return WindowsAutomationResult(
+            True,
+            "desktop_verified",
+            f"Verified '{text}' is visible.",
+            {"text": text, "app": app_name, "control_types": control_types or [], "exclude_control_types": exclude_control_types or []},
+        )
 
 
 async def wait_for_run(service: AutomationService, run_id: str, statuses: set[str], timeout: float = 3.0):
@@ -133,7 +142,7 @@ async def test_recipe_builder_saves_direct_whatsapp_goal_as_executable_desktop_r
     assert recipe.status == "executable"
     assert recipe.risk == "safe_confirm"
     assert [step["tool"] for step in recipe.steps][:2] == ["app.resolve", "app.open"]
-    assert "desktop.press_key" in [step["tool"] for step in recipe.steps]
+    assert "windows.send_prepared_whatsapp_message" in [step["tool"] for step in recipe.steps]
     assert "system.ask_user" not in [step["tool"] for step in recipe.steps]
 
 
@@ -146,8 +155,20 @@ async def test_direct_message_prompt_uses_desktop_plan_before_llm(tmp_path):
 
     assert tools[:2] == ["app.resolve", "app.open"]
     assert "windows.prepare_whatsapp_message" in tools
-    assert "desktop.press_key" in tools
+    assert "windows.send_prepared_whatsapp_message" in tools
     assert tools[-1] == "desktop.verify_text"
+    assert steps[-1]["args"]["exclude_control_types"] == ["Edit"]
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_message_parser_strips_app_words_from_message(tmp_path):
+    service = build_service(tmp_path)
+
+    steps = await service._plan_steps("open whatsapp and send whatsapp message hello to anurag 1")
+    prepare_step = next(step for step in steps if step["tool"] == "windows.prepare_whatsapp_message")
+
+    assert prepare_step["args"]["contact"] == "anurag 1"
+    assert prepare_step["args"]["message"] == "hello"
 
 
 @pytest.mark.asyncio
@@ -161,12 +182,12 @@ async def test_direct_message_run_waits_for_send_confirmation_before_pressing_en
 
     assert waiting.confirmation is not None
     assert ("prepare_whatsapp_message", "bebo 2:hello") in fake_windows.calls
-    assert ("press_key", "enter") not in fake_windows.calls
+    assert ("send_prepared_whatsapp_message", "bebo 2:hello") not in fake_windows.calls
 
     await service.confirm_run(run.id, AutomationConfirmRequest(approved=True))
     finished = await wait_for_run(service, run.id, {"complete"})
 
-    assert ("press_key", "enter") in fake_windows.calls
+    assert ("send_prepared_whatsapp_message", "bebo 2:hello") in fake_windows.calls
     assert ("verify_text", "hello") in fake_windows.calls
     assert finished.result == "Verified 'hello' is visible."
 

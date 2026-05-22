@@ -69,6 +69,7 @@ ALLOWED_AUTOMATION_TOOLS = {
     "windows.open_calculator",
     "windows.open_file_explorer",
     "windows.prepare_whatsapp_message",
+    "windows.send_prepared_whatsapp_message",
     "windows.reject_destructive_file_action",
     "automation.save_recipe",
     "task.finish",
@@ -1129,6 +1130,11 @@ class AutomationService:
                 args["message"] = str(args.get("message") or "").strip()[:500]
                 if not args["contact"] or not args["message"]:
                     continue
+            if tool == "windows.send_prepared_whatsapp_message":
+                args["contact"] = str(args.get("contact") or "").strip()[:120]
+                args["expected_message"] = str(args.get("expected_message") or args.get("message") or "").strip()[:500]
+                if not args["expected_message"]:
+                    continue
             if tool == "windows.reject_destructive_file_action":
                 args["reason"] = str(args.get("reason") or "Astra blocked this destructive file action.").strip()[:240]
             clean_steps.append({"tool": tool, "description": description, "args": args})
@@ -1253,6 +1259,8 @@ class AutomationService:
             await self._tool_windows_open_file_explorer(run, step["args"])
         elif tool == "windows.prepare_whatsapp_message":
             await self._tool_windows_prepare_whatsapp_message(run, step["args"])
+        elif tool == "windows.send_prepared_whatsapp_message":
+            await self._tool_windows_send_prepared_whatsapp_message(run, step["args"])
         elif tool == "windows.reject_destructive_file_action":
             await self._tool_windows_reject_destructive_file_action(run, step["args"])
         elif tool == "task.finish":
@@ -1352,6 +1360,20 @@ class AutomationService:
         context["last_app_name"] = "WhatsApp"
         context["whatsapp_contact"] = contact
         context["whatsapp_message_length"] = len(message)
+        self._sync_runtime_context_to_run(run)
+        run.result = result.message
+
+    async def _tool_windows_send_prepared_whatsapp_message(self, run: AutomationRun, args: dict[str, Any]) -> None:
+        contact = str(args.get("contact") or "").strip()
+        expected_message = str(args.get("expected_message") or args.get("message") or "").strip()
+        result = await asyncio.to_thread(self.windows.send_prepared_whatsapp_message, contact, expected_message)
+        self._append_windows_result(run, result)
+        if not result.ok:
+            raise ValueError(result.message)
+        context = self._runtime_context_for(run)
+        context["last_app_name"] = "WhatsApp"
+        context["whatsapp_contact"] = contact or context.get("whatsapp_contact", "")
+        context["whatsapp_sent_message_length"] = len(expected_message)
         self._sync_runtime_context_to_run(run)
         run.result = result.message
 
@@ -1677,7 +1699,14 @@ class AutomationService:
     async def _tool_desktop_verify_text(self, run: AutomationRun, args: dict[str, Any]) -> None:
         text = str(args.get("text") or "").strip()
         app_name = str(args.get("app_name") or self._runtime_context_for(run).get("last_app_name") or "").strip()
-        result = await asyncio.to_thread(self.windows.verify_text, text, app_name, int(args.get("timeout") or 6))
+        result = await asyncio.to_thread(
+            self.windows.verify_text,
+            text,
+            app_name,
+            int(args.get("timeout") or 6),
+            args.get("control_types") if isinstance(args.get("control_types"), list) else [],
+            args.get("exclude_control_types") if isinstance(args.get("exclude_control_types"), list) else [],
+        )
         self._append_windows_result(run, result)
         if not result.ok:
             raise ValueError(result.message)
@@ -2312,6 +2341,8 @@ class AutomationService:
         tool = step["tool"]
         if tool in {"browser.download", "python.run_safe"}:
             return True
+        if tool == "windows.send_prepared_whatsapp_message":
+            return True
         if tool == "desktop.press_key":
             key = str(step.get("args", {}).get("key") or "").strip().lower()
             if key == "enter" and re.search(r"\b(send|submit|post|publish|message|email|dm|text)\b", run.prompt, re.IGNORECASE):
@@ -2329,6 +2360,8 @@ class AutomationService:
             return "Astra needs approval before running Python for this automation."
         if step["tool"] == "browser.download":
             return "Astra needs approval before downloading a file."
+        if step["tool"] == "windows.send_prepared_whatsapp_message":
+            return "Astra needs approval before sending this WhatsApp message."
         if step["tool"] == "desktop.press_key":
             return "Astra needs approval before sending or submitting this desktop action."
         return f"Astra needs approval before: {step['description']}"

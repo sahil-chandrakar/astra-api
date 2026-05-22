@@ -106,8 +106,16 @@ class AutomationBuilderService:
                     "description": f"Open chat with {contact} and type the message.",
                     "args": {"contact": contact, "message": message},
                 },
-                {"tool": "desktop.press_key", "description": "Send the message after approval.", "args": {"key": "Enter"}},
-                {"tool": "desktop.verify_text", "description": "Verify the sent message is visible.", "args": {"text": message, "app_name": "WhatsApp"}},
+                {
+                    "tool": "windows.send_prepared_whatsapp_message",
+                    "description": "Send the prepared WhatsApp message after approval.",
+                    "args": {"contact": contact, "expected_message": message},
+                },
+                {
+                    "tool": "desktop.verify_text",
+                    "description": "Verify the sent message is visible.",
+                    "args": {"text": message, "app_name": "WhatsApp", "exclude_control_types": ["Edit"], "timeout": 10},
+                },
             ]
         return [
             {"tool": "app.resolve", "description": f"Resolve {app_name}.", "args": {"app_name": app_name}},
@@ -150,6 +158,8 @@ class AutomationBuilderService:
             msg_match = re.search(r"\bsend(?:\s+message)?\s+(.+?)\s+\bto\b", goal, re.IGNORECASE)
             if msg_match:
                 message = msg_match.group(1).strip(" .")
+                message = re.sub(r"^(?:whats\s*app|whatsapp|telegram|discord|slack|sms|messages?)\s+", "", message, flags=re.IGNORECASE).strip(" .")
+                message = re.sub(r"^(?:message|text)\s+", "", message, flags=re.IGNORECASE).strip(" .")
 
         contact = ""
         contact_match = re.search(r"\bto\s+(.+)$", goal, re.IGNORECASE)
@@ -199,7 +209,7 @@ class AutomationBuilderService:
     def _ensure_safety_gate(self, goal: str, steps: list[dict[str, Any]], risk: AgentCommandRisk) -> list[dict[str, Any]]:
         if risk != "safe_confirm":
             return steps
-        if any(step.get("tool") in {"desktop.press_key", "python.run_safe", "browser.download"} for step in steps):
+        if any(step.get("tool") in {"desktop.press_key", "windows.send_prepared_whatsapp_message", "python.run_safe", "browser.download"} for step in steps):
             return steps
         has_gate = any(step.get("tool") == "system.ask_user" for step in steps)
         if has_gate:
