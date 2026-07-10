@@ -36,6 +36,7 @@ from app.models import (
 from app.services.agent_intent import AgentIntentParser
 from app.services.desktop import SAFE_TARGETS, DesktopActionService, DesktopTarget
 from app.services.documents import DocumentService
+from app.services.form_filler import FormFillerService
 from app.services.memory import MemoryService
 from app.services.mock_tests import MOCK_TEST_GENERATION_TIMEOUT_SECONDS, MockTestService, MockTestSourceMaterialError
 from app.services.reports import ReportService
@@ -88,6 +89,7 @@ class SafeAgentService:
         mock_tests: MockTestService,
         desktop: DesktopActionService,
         voice: VoiceService,
+        form_filler: FormFillerService | None = None,
     ):
         self.settings = settings
         self.reports = reports
@@ -99,6 +101,7 @@ class SafeAgentService:
         self.voice = voice
         self.llm = study.llm
         self.intent_parser = AgentIntentParser(settings, self.llm)
+        self.form_filler = form_filler or FormFillerService(settings, self.llm)
 
         self.backend_dir = Path(__file__).resolve().parents[2]
         self.project_root = self.backend_dir.parent
@@ -158,6 +161,10 @@ class SafeAgentService:
         if not normalized:
             return None
 
+        form_fill = self._resolve_form_fill_request(text, normalized, confirmed)
+        if form_fill:
+            return form_fill
+
         unsafe = self._unsafe_request(text, normalized, confirmed)
         if unsafe:
             return unsafe
@@ -188,6 +195,10 @@ class SafeAgentService:
         normalized = self._normalize(text)
         if not normalized:
             return None
+
+        form_fill = self._resolve_form_fill_request(text, normalized, confirmed)
+        if form_fill:
+            return form_fill
 
         unsafe = self._unsafe_request(text, normalized, confirmed)
         if unsafe:
@@ -234,6 +245,90 @@ class SafeAgentService:
             )
         return None
 
+    def _resolve_form_fill_request(self, text: str, normalized: str, confirmed: bool) -> AgentCommandRequest | None:
+        if not self._is_form_fill_intent(normalized):
+            return None
+        direct_url = self._extract_direct_url(text)
+        site_query = self._extract_form_site_query(text, direct_url)
+        resolution = self._resolution_meta("intent", 0.98, "web form fill", normalized)
+        resolution["intent"] = "fill_web_form"
+        resolution["needs_confirmation"] = True
+        params: dict[str, Any] = {"task": text.strip()}
+        continue_current = self._is_form_continue_intent(normalized)
+        if continue_current:
+            params["continue_current"] = True
+        if direct_url:
+            params["url"] = direct_url
+        elif site_query and not continue_current:
+            params["site_query"] = site_query
+        return AgentCommandRequest(
+            command_id="fill_web_form",
+            input_text=text,
+            params=params,
+            confirmed=confirmed,
+            resolution=resolution,
+        )
+
+    def _is_form_fill_intent(self, normalized: str) -> bool:
+        if self._is_form_continue_intent(normalized):
+            return True
+        direct_like = "http " in normalized or "https " in normalized
+        has_fill_action = re.search(r"\b(fill|complete|populate|apply|register|enroll|sign\s*up|signup)\b", normalized)
+        has_form_context = re.search(
+            r"\b(form|application|registration|signup|contact|admission|job|survey|profile|details)\b",
+            normalized,
+        )
+        has_field_context = re.search(r"\b(name|email|phone|mobile|address|message|field|details?)\b", normalized)
+        account_intent = re.search(
+            r"\b(login|log\s*in|sign\s*in|signin|sign\s*up|signup|create\s+(?:an\s+)?(?:\w+\s+){0,4}account|new\s+account|account\s+creation|register|registration)\b",
+            normalized,
+        )
+        known_site_context = re.search(
+            r"\b(youtube|you\s*tube|yt|gmail|google|github|gitlab|linkedin|reddit|instagram|facebook|"
+            r"twitter|x\.com|microsoft|outlook|hotmail|amazon|flipkart|naukri|indeed|coursera|udemy|"
+            r"stack\s*overflow|stackoverflow)\b",
+            normalized,
+        )
+        if account_intent and known_site_context and not self._is_youtube_media_automation_intent(normalized):
+            return True
+        return bool(has_fill_action and (direct_like or has_form_context or has_field_context or known_site_context))
+
+    def _is_form_continue_intent(self, normalized: str) -> bool:
+        return bool(
+            re.search(r"\b(continue|resume|carry on|go on|next step|i handled|done manually|human done)\b", normalized)
+            and re.search(r"\b(form|signup|sign up|login|registration|application|captcha|otp|verification|password|account)\b", normalized)
+        )
+
+    def _is_youtube_media_automation_intent(self, normalized: str) -> bool:
+        if not re.search(r"\b(youtube|you\s*tube|yt)\b", normalized):
+            return False
+        if re.search(r"\b(fill|complete|populate)\b", normalized) and re.search(r"\b(form|login|account|registration|signup)\b", normalized):
+            return False
+        media_intent = re.search(
+            r"\b(search|find|play|watch|latest|newest|recent|popular|shorts?|live|stream|channel|video|song|title|name|filter|download)\b",
+            normalized,
+        )
+        return bool(media_intent)
+
+    def _extract_form_site_query(self, text: str, direct_url: str | None) -> str:
+        cleaned = text
+        if direct_url:
+            cleaned = cleaned.replace(direct_url, " ")
+        cleaned = re.sub(
+            r"\b(please|can you|astra|open|go to|visit|fill|complete|populate|with|using|my|details?|form|application|registration)\b",
+            " ",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(r"https?://\S+", " ", cleaned)
+        cleaned = re.sub(
+            r"\b(name|email|phone|mobile|address|message|city|state|country)\s*(?:is|=|:|-)\s*[^,;\n]+",
+            " ",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        return re.sub(r"\s+", " ", cleaned).strip(" .")[:180]
+
     def _resolve_mock_test_follow_up(self, text: str, normalized: str, confirmed: bool) -> AgentCommandRequest | None:
         if not self._mentions_mock_test(normalized):
             return None
@@ -262,6 +357,8 @@ class SafeAgentService:
                 continue
             if candidate.command_id == "generate_mock_test" and not self._is_mock_generation_intent(normalized):
                 continue
+            if candidate.command_id == "fill_web_form" and not self._is_form_fill_intent(normalized):
+                continue
             for alias in candidate.aliases:
                 alias_normalized = self._normalize(alias)
                 if alias_normalized and re.search(rf"\b{re.escape(alias_normalized)}\b", normalized):
@@ -276,6 +373,8 @@ class SafeAgentService:
     def _resolve_fuzzy_candidate(self, text: str, normalized: str, confirmed: bool) -> AgentCommandRequest | None:
         best = self._best_intent_match(normalized)
         if not best or best.score < 72:
+            return None
+        if best.candidate.command_id == "fill_web_form" and not self._is_form_fill_intent(normalized):
             return None
 
         command = self.commands.get(best.candidate.command_id)
@@ -359,6 +458,9 @@ class SafeAgentService:
                     confirmed=confirmed,
                     resolution=resolution,
                 )
+            return None
+
+        if command_id == "fill_web_form" and not self._is_form_fill_intent(normalized):
             return None
 
         if command_id == "clarify_agent_intent" and not re.search(
@@ -563,6 +665,18 @@ class SafeAgentService:
                 "mode": "mcq",
                 "duration_minutes": int(params.get("duration_minutes", 20)),
             }
+        elif candidate.command_id == "fill_web_form":
+            direct_url = self._extract_direct_url(text)
+            params = {"task": text.strip()}
+            continue_current = self._is_form_continue_intent(normalized)
+            if continue_current:
+                params["continue_current"] = True
+            if direct_url:
+                params["url"] = direct_url
+            else:
+                site_query = self._extract_form_site_query(text, direct_url)
+                if site_query and not continue_current:
+                    params["site_query"] = site_query
 
         resolution = self._resolution_meta(source, confidence, matched_alias, normalized)
         if needs_confirmation:
@@ -650,7 +764,7 @@ class SafeAgentService:
             return False
         if re.search(r"\b(test|quiz|assess|challenge)\s+(me|my knowledge)?\b", normalized):
             return True
-        if re.search(r"\b(ask|give)\s+(me\s+)?(some\s+|a\s+)?(questions?|mcqs?|quiz)\b", normalized):
+        if re.search(r"\b(ask|give)\s+(me\s+)?(some\s+|a\s+)?((?:numerical|numeric|calculation[- ]?based|practice|mixed|easy|medium|hard)\s+)?(questions?|mcqs?|quiz)\b", normalized):
             return True
         return False
 
@@ -732,7 +846,21 @@ class SafeAgentService:
         cleaned = re.sub(r"\b(on|about|for)\s+(the\s+)?topic\s+", "", cleaned, flags=re.IGNORECASE)
         if cleaned == text.strip() and matched_alias:
             cleaned = re.sub(rf"^\s*(please\s+)?{re.escape(matched_alias)}\s*(for|on|about|of)?\s*", "", text.strip(), flags=re.IGNORECASE).strip(" .")
-        return cleaned
+        return self._clean_mock_topic(cleaned)
+
+    def _clean_mock_topic(self, text: str) -> str:
+        cleaned = re.sub(r"\s+", " ", str(text or "")).strip(" .,")
+        cleaned = re.sub(r"\b(?:with|having|containing)\s+\d{1,2}\s*[- ]?(?:questions?|qs?|mcqs?)\b", " ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\b\d{1,2}\s*[- ]?(?:questions?|qs?|mcqs?)\b", " ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\b(?:mcqs?|multiple\s+choice\s+questions?|questions?)\b", " ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\b(?:with|for|of)?\s*\d{1,3}\s*(?:minutes?|mins?|min|hours?|hrs?)\b", " ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\b(?:easy|medium|hard|mixed)\s+(?:difficulty|level)\b", " ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\b(?:difficulty|level)\s*[:=-]?\s*(?:easy|medium|hard|mixed)\b", " ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"(?:^|[,;]\s*)(?:easy|medium|hard|mixed)\s*$", " ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"^\s*(for|on|about|of|in)\s+", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s+(with|for|and|on|about|of|in)\s*$", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*[,;]\s*", " ", cleaned)
+        return re.sub(r"\s+", " ", cleaned).strip(" .,")
 
     def _extract_existing_mock_topic(self, text: str) -> str:
         cleaned = self._normalize(text)
@@ -1026,6 +1154,37 @@ class SafeAgentService:
                 resolution=resolution,
             )
 
+        if command.id == "fill_web_form" and not request.confirmed:
+            ok, message, payload = await self.form_filler.preview({**params, "input_text": request.input_text})
+            if not ok:
+                return self._response(
+                    command_id=command.id,
+                    label=command.label,
+                    risk=command.risk,
+                    outcome="failure",
+                    message=message,
+                    safety_decision="form_fill_preview_failed",
+                    input_text=request.input_text,
+                    params=params,
+                    data=payload,
+                    resolution=resolution,
+                )
+            preview = payload.get("preview") if isinstance(payload.get("preview"), dict) else {}
+            fill_params = payload.get("params") if isinstance(payload.get("params"), dict) else params
+            return self._response(
+                command_id=command.id,
+                label=command.label,
+                risk=command.risk,
+                outcome="confirmation_required",
+                message=message,
+                safety_decision="form_fill_preview_ready",
+                input_text=request.input_text,
+                params=fill_params,
+                data={"form_fill_preview": preview},
+                confirmation_required=True,
+                resolution=resolution,
+            )
+
         if resolution.get("needs_confirmation") and not request.confirmed:
             return self._response(
                 command_id=command.id,
@@ -1258,6 +1417,24 @@ class SafeAgentService:
                 tester=self._test_desktop_ready,
             ),
             AgentCommandDefinition(
+                id="fill_web_form",
+                label="Fill Web Form",
+                description="Open or search for a web form, preview mapped fields, and fill after confirmation without submitting.",
+                category="Browser",
+                risk="safe_confirm",
+                params_schema={
+                    "url": {"type": "string", "format": "uri"},
+                    "site_query": {"type": "string"},
+                    "task": {"type": "string"},
+                    "field_values": {"type": "object"},
+                    "continue_current": {"type": "boolean"},
+                    "flow_type": {"type": "string"},
+                },
+                required_params=("task",),
+                executor=self._exec_fill_web_form,
+                tester=self._test_form_filler_ready,
+            ),
+            AgentCommandDefinition(
                 id="save_memory",
                 label="Save Memory",
                 description="Save an explicit user memory.",
@@ -1436,6 +1613,9 @@ class SafeAgentService:
             return False, f"Windows could not open that URL: {exc}", {"url": url}
         return True, f"Opened {url}.", {"url": url}
 
+    async def _exec_fill_web_form(self, params: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
+        return await self.form_filler.fill(params)
+
     async def _exec_save_memory(self, params: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
         item = self.memory.create(AgentMemoryCreateRequest(category=params.get("category", "general"), text=params["text"]))
         return True, "Saved that memory.", {"memory": item.model_dump(mode="json")}
@@ -1547,6 +1727,9 @@ class SafeAgentService:
     async def _test_desktop_ready(self) -> tuple[bool, str]:
         return (bool(self.safe_targets), "Approved desktop targets are registered.")
 
+    async def _test_form_filler_ready(self) -> tuple[bool, str]:
+        return (self.form_filler.browser_profile_dir.exists(), "Form filler browser profile is available.")
+
     async def _test_frontend_ready(self) -> tuple[bool, str]:
         package_json = self.frontend_dir / "package.json"
         return (package_json.exists(), "Frontend package is available." if package_json.exists() else "Frontend package.json was not found.")
@@ -1600,6 +1783,33 @@ class SafeAgentService:
                 return clean, "Only valid http(s) URLs can be opened."
             clean["url"] = url
 
+        if command.id == "fill_web_form":
+            task = str(clean.get("task") or "").strip()
+            site_query = str(clean.get("site_query") or "").strip()
+            url = str(clean.get("url") or "").strip()
+            if url:
+                parsed = urlparse(url)
+                if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                    return clean, "Only valid http(s) URLs can be used for form filling."
+                clean["url"] = url
+            elif "url" in clean:
+                clean.pop("url", None)
+            if not task and not site_query and not clean.get("url"):
+                return clean, "Tell Astra which form page to open and what to fill."
+            clean["task"] = task[:1200]
+            if site_query:
+                clean["site_query"] = site_query[:180]
+            elif "site_query" in clean:
+                clean.pop("site_query", None)
+            field_values = clean.get("field_values")
+            clean["field_values"] = {str(key): value for key, value in field_values.items()} if isinstance(field_values, dict) else {}
+            clean["continue_current"] = bool(clean.get("continue_current"))
+            flow_type = str(clean.get("flow_type") or "").strip()
+            if flow_type:
+                clean["flow_type"] = flow_type[:40]
+            elif "flow_type" in clean:
+                clean.pop("flow_type", None)
+
         if command.id == "open_latest_mock_test":
             topic = str(clean.get("topic", "")).strip(" .")
             if topic:
@@ -1626,7 +1836,7 @@ class SafeAgentService:
                 return clean, "Study artifact topic cannot be empty."
 
         if command.id == "generate_mock_test":
-            clean["topic"] = str(clean.get("topic", "")).strip(" .")
+            clean["topic"] = self._clean_mock_topic(str(clean.get("topic", "")).strip(" ."))
             if not clean["topic"]:
                 return clean, "Mock test topic cannot be empty."
             if self._mock_topic_looks_like_status(clean["topic"]):
@@ -1843,6 +2053,26 @@ class SafeAgentService:
         add("run_frontend_lint", "Run Frontend Lint", ("run frontend lint", "frontend lint", "npm lint", "lint frontend"))
         add("run_backend_tests", "Run Backend Tests", ("run backend tests", "backend tests", "pytest", "run pytest"))
         add("start_frontend_dev_server", "Start Frontend Dev Server", ("start frontend dev server", "run frontend server", "start dev server", "next dev"))
+        add(
+            "fill_web_form",
+            "Fill Web Form",
+            (
+                "fill form",
+                "fill web form",
+                "complete form",
+                "fill application",
+                "fill registration",
+                "register on website",
+                "apply on website",
+                "fill contact form",
+                "fill this link",
+                "login to website",
+                "sign in to website",
+                "create account on website",
+                "continue form fill",
+                "resume form fill",
+            ),
+        )
         add("save_memory", "Save Memory", ("remember", "rember", "remeber", "save memory", "add memory", "memorize", "memo"))
         add("generate_study_artifact", "Generate Notes", ("generate notes", "create notes", "make notes", "notes"), {"artifact_type": "notes"})
         add("generate_study_artifact", "Generate Flashcards", ("generate flashcards", "create flashcards", "make flashcards", "flashcards", "flashcrds"), {"artifact_type": "flashcards"})

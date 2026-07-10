@@ -214,21 +214,35 @@ class MockTestIntelligenceService:
         pool = self._question_pool()
         selected_templates: list[dict[str, Any]] = []
         unit_text = " ".join([request.topic, blueprint.exam, blueprint.subject, *blueprint.syllabus_units]).lower()
-        for key, templates in pool.items():
-            if blueprint.subject == "Cyber Security" and key != "cyber":
-                continue
-            if key == "science" and "school" not in unit_text and self._normalize(blueprint.subject) != "science":
-                continue
-            if key == "data" and not re.search(r"\bdata\s+structures?\b", unit_text):
-                continue
-            if self._contains_term(unit_text, key):
-                selected_templates.extend(templates)
+        focused_keys = self._focused_template_keys(request.topic, pool)
+        if focused_keys:
+            for key in focused_keys:
+                selected_templates.extend(pool.get(key, []))
+        elif blueprint.blueprint_source == "profile:ugc_net_cs":
+            selected_templates.extend(
+                self._round_robin_template_groups(
+                    [pool.get(key, []) for key in ("data", "algorithm", "database", "operating", "network", "theory", "discrete")],
+                    max(request.question_count + 8, 24),
+                )
+            )
+
+        if len(self._dedupe_templates(selected_templates)) < request.question_count:
+            for key, templates in pool.items():
+                if blueprint.subject == "Cyber Security" and key != "cyber":
+                    continue
+                if key == "science" and "school" not in unit_text and self._normalize(blueprint.subject) != "science":
+                    continue
+                if key == "data" and not re.search(r"\bdata\s+structures?\b", unit_text):
+                    continue
+                if self._contains_term(unit_text, key):
+                    selected_templates.extend(templates)
 
         if not selected_templates:
             for unit in blueprint.syllabus_units:
                 selected_templates.extend(self._templates_for_unit(unit, pool))
 
         selected_templates = self._dedupe_templates(selected_templates)
+        selected_templates = self._rank_templates_for_blueprint(selected_templates, request, blueprint)
         if not selected_templates:
             return []
 
@@ -239,11 +253,24 @@ class MockTestIntelligenceService:
             if difficulty in {"easy", "medium", "hard"}:
                 buckets[difficulty].append(item)
 
-        desired_sequence = self._difficulty_sequence(request.difficulty, request.question_count)
+        candidate_count = max(request.question_count, min(50, request.question_count + 6))
+        desired_sequence = self._difficulty_sequence(request.difficulty, candidate_count)
         questions: list[MockQuestion] = []
+        used_prompts: set[str] = set()
+        bucket_positions: dict[str, int] = {"easy": 0, "medium": 0, "hard": 0, "mixed": 0, "all": 0}
         for index, desired in enumerate(desired_sequence):
-            candidates = buckets[desired] or buckets["medium"] or buckets["easy"] or buckets["hard"] or normalized_templates
-            item = self._adapt_template_for_difficulty(candidates[index % len(candidates)], desired, blueprint, index)
+            candidate_groups = [
+                (desired, buckets[desired]),
+                ("medium", buckets["medium"]),
+                ("easy", buckets["easy"]),
+                ("hard", buckets["hard"]),
+                ("all", normalized_templates),
+            ]
+            selected = self._next_unused_template(candidate_groups, bucket_positions, used_prompts)
+            if not selected:
+                break
+            used_prompts.add(str(selected.get("prompt", "")).strip().lower())
+            item = self._adapt_template_for_difficulty(selected, desired, blueprint, index)
             question = MockQuestion(
                 id=f"q{index + 1}",
                 prompt=str(item["prompt"]),
@@ -393,8 +420,8 @@ class MockTestIntelligenceService:
         generation_mode = "pyq_style" if is_pyq_style else "profile_based"
         focus_units = self._focus_units(request.topic, profile.syllabus_units)
         return MockBlueprint(
-            exam=profile.exam,
-            subject=profile.subject,
+            exam=request.exam or profile.exam,
+            subject=profile.subject or request.subject,
             topic=request.topic,
             generation_mode=generation_mode,
             blueprint_source=f"profile:{profile.id}",
@@ -435,7 +462,7 @@ class MockTestIntelligenceService:
         )
 
     def _match_profile(self, request: MockTestGenerateRequest) -> ExamProfile | None:
-        haystack = self._normalize(" ".join([request.topic, request.source_query, *request.constraints]))
+        haystack = self._normalize(" ".join([request.topic, request.exam, request.subject, request.source_query, *request.constraints]))
         best: tuple[int, ExamProfile] | None = None
         for profile in self.profiles:
             score = 0
@@ -450,12 +477,27 @@ class MockTestIntelligenceService:
         return best[1] if best else None
 
     def _profile_alias_allowed(self, profile: ExamProfile, normalized_alias: str, haystack: str) -> bool:
+        if profile.id.startswith("school_") and re.search(r"\b(jee|neet|gate|ugc|net|upsc|ssc|banking|cgl)\b", haystack):
+            return bool(re.search(r"\b(school|class|grade|standard|std|cbse|icse)\b", haystack))
         if profile.id == "school_science" and normalized_alias == "science":
             if re.search(r"\b(computer science|data science|political science|discrete mathematics)\b", haystack):
                 return False
             return bool(re.search(r"\b(school|class 9|class 10|science basics|science quiz|science test)\b", haystack))
         if profile.id == "school_math" and normalized_alias == "mathematics basics":
             return bool(re.search(r"\b(school|class 9|class 10|basics)\b", haystack))
+        if profile.id == "indian_history" and normalized_alias == "history":
+            if re.search(r"\b(python|javascript|programming|computer|browser|git|code|software)\b", haystack):
+                return False
+        if profile.id == "ugc_net_paper1":
+            paper_two_or_subject_specific = re.search(
+                r"\b(paper\s*(?:2|ii)|paper[- ]?(?:2|ii)|computer\s+science|computer\s+applications?|cs|cse|dsa|data\s+structures?|"
+                r"algorithm|arrays?|dbms|operating\s+systems?|computer\s+networks?|history|geography|commerce|management|economics?|"
+                r"education|english|hindi|sociology|psychology|law|political\s+science|library\s+science|environmental\s+science)\b",
+                haystack,
+            )
+            explicit_paper_one = re.search(r"\b(paper\s*(?:1|i)|paper[- ]?(?:1|i)|teaching\s+aptitude|research\s+aptitude)\b", haystack)
+            if paper_two_or_subject_specific and not explicit_paper_one:
+                return False
         return True
 
     def _focus_units(self, topic: str, units: tuple[str, ...]) -> list[str]:
@@ -466,7 +508,9 @@ class MockTestIntelligenceService:
             "os": ("operating", "scheduling", "deadlock", "paging"),
             "cn": ("network", "networks", "tcp", "subnet"),
             "toc": ("theory", "automata", "computation"),
-            "dsa": ("data", "algorithm", "structures"),
+            "dsa": ("data", "algorithm", "structures", "array", "stack", "queue", "tree", "graph"),
+            "array": ("array", "data", "algorithm", "structures"),
+            "arrays": ("array", "data", "algorithm", "structures"),
             "genetics": ("genetics", "evolution"),
         }
         expanded_topic = normalized_topic
@@ -486,6 +530,71 @@ class MockTestIntelligenceService:
             if self._contains_term(normalized, key) or any(self._contains_term(self._normalize(tag), key) for item in items for tag in item.get("tags", [])):
                 templates.extend(items)
         return templates
+
+    def _next_unused_template(
+        self,
+        candidate_groups: list[tuple[str, list[dict[str, Any]]]],
+        bucket_positions: dict[str, int],
+        used_prompts: set[str],
+    ) -> dict[str, Any] | None:
+        for bucket_name, candidates in candidate_groups:
+            if not candidates:
+                continue
+            start = bucket_positions.get(bucket_name, 0)
+            for offset in range(len(candidates)):
+                item = candidates[(start + offset) % len(candidates)]
+                prompt_key = str(item.get("prompt", "")).strip().lower()
+                if prompt_key and prompt_key not in used_prompts:
+                    bucket_positions[bucket_name] = start + offset + 1
+                    return item
+        return None
+
+    def _round_robin_template_groups(self, groups: list[list[dict[str, Any]]], limit: int) -> list[dict[str, Any]]:
+        merged: list[dict[str, Any]] = []
+        max_len = max((len(group) for group in groups), default=0)
+        for index in range(max_len):
+            for group in groups:
+                if index < len(group):
+                    merged.append(group[index])
+                    if len(merged) >= limit:
+                        return merged
+        return merged
+
+    def _focused_template_keys(self, topic: str, pool: dict[str, list[dict[str, Any]]]) -> list[str]:
+        normalized = self._normalize(topic)
+        pattern_map: tuple[tuple[str, tuple[str, ...]], ...] = (
+            (r"\barrays?\b", ("array",)),
+            (r"\b(?:dbms|databases?|normalization|sql|transactions?)\b", ("database",)),
+            (r"\b(?:operating\s+systems?|os|deadlock|paging|scheduling|memory\s+management)\b", ("operating",)),
+            (r"\b(?:computer\s+networks?|networking|network|cn|tcp|udp|subnet|routing)\b", ("network",)),
+            (r"\b(?:toc|automata|theory\s+of\s+computation|regular\s+languages?|pda|cfg|compiler|lexical|lexer|parser)\b", ("theory",)),
+            (r"\b(?:discrete|combinatorics|set\s+theory|relations?|graph\s+theory)\b", ("discrete",)),
+            (r"\b(?:python|django|flask|pandas)\b", ("python",)),
+            (r"\b(?:genetics|mendel|dna|rna|inheritance)\b", ("genetics",)),
+            (r"\b(?:electricity|current|resistance|voltage|ohm|optics|motion|force|electrostatics?|electric\s+field|potential|capacitance)\b", ("physics",)),
+            (r"\b(?:chemistry|acid|base|mole|bond|enthalpy)\b", ("chemistry",)),
+            (r"\b(?:commerce|accounting|audit|auditing|income\s+tax|gst|business\s+finance|financial\s+management)\b", ("commerce",)),
+            (r"\b(?:history|modern\s+india|ancient\s+india|medieval\s+india)\b", ("history",)),
+            (r"\b(?:geography|climate|monsoon|geomorphology)\b", ("geography",)),
+            (r"\bteaching\b", ("teaching",)),
+            (r"\bresearch\b", ("research",)),
+            (r"\bcommunication\b", ("communication",)),
+            (r"\b(?:logical|syllogism|fallacy)\b", ("logical",)),
+            (r"\b(?:mathematical|ratio|percentage|average)\b", ("mathematical",)),
+            (r"\b(?:interpretation|bar\s+chart|pie\s+chart)\b", ("interpretation",)),
+            (r"\bict\b", ("ict",)),
+            (r"\b(?:environment|environmental)\b", ("environment",)),
+            (r"\b(?:higher\s+education|universit(?:y|ies)|ugc\s+policy)\b", ("higher",)),
+            (r"\b(?:polity|constitution|political|fundamental\s+rights?|directive\s+principles|parliament|judiciary)\b", ("polity",)),
+            (r"\bcyber\b", ("cyber",)),
+        )
+        keys: list[str] = []
+        for pattern, candidates in pattern_map:
+            if re.search(pattern, normalized):
+                for key in candidates:
+                    if key in pool and key not in keys:
+                        keys.append(key)
+        return keys
 
     def _units_from_text(self, text: str, topic: str) -> list[str]:
         if not text.strip():
@@ -600,6 +709,46 @@ class MockTestIntelligenceService:
                 unique.append(item)
                 seen.add(prompt)
         return unique
+
+    def _rank_templates_for_blueprint(self, items: list[dict[str, Any]], request: MockTestGenerateRequest, blueprint: MockBlueprint) -> list[dict[str, Any]]:
+        if not items:
+            return []
+        if blueprint.blueprint_source == "profile:ugc_net_cs" and not re.search(
+            r"\b(dbms|database|os|operating|network|toc|automata|compiler|discrete|algorithm|data\s+structure|arrays?)\b",
+            self._normalize(request.topic),
+        ):
+            return items
+        terms = [
+            term
+            for term in self._merge_terms(
+                self._terms(request.topic),
+                self._terms(" ".join(blueprint.syllabus_units)),
+                list(blueprint.expected_terms),
+            )
+            if len(self._normalize(term)) >= 4
+        ]
+        if not terms:
+            return items
+
+        scored: list[tuple[int, int, dict[str, Any]]] = []
+        for index, item in enumerate(items):
+            combined = self._normalize(
+                " ".join(
+                    [
+                        str(item.get("prompt", "")),
+                        str(item.get("explanation", "")),
+                        " ".join(str(option) for option in item.get("options", [])),
+                        " ".join(str(tag) for tag in item.get("tags", [])),
+                    ]
+                )
+            )
+            score = sum(1 for term in terms if self._contains_term(combined, term))
+            scored.append((score, index, item))
+
+        focused = [item for score, _, item in scored if score > 0]
+        if len(focused) >= min(len(items), max(3, request.question_count)):
+            return [item for _, _, item in sorted((entry for entry in scored if entry[0] > 0), key=lambda entry: (-entry[0], entry[1]))]
+        return [item for _, _, item in sorted(scored, key=lambda entry: (-entry[0], entry[1]))]
 
     def _difficulty_sequence(self, difficulty: MockTestDifficulty, count: int) -> list[MockTestDifficulty]:
         if difficulty in {"easy", "medium", "hard"}:
@@ -738,7 +887,26 @@ class MockTestIntelligenceService:
                 id="ugc_net_cs",
                 exam="UGC NET",
                 subject="Computer Science",
-                aliases=("ugc net cs", "net ugc cs", "ugc net computer science", "net computer science", "ugc net cse"),
+                aliases=(
+                    "ugc net cs",
+                    "net ugc cs",
+                    "ugc net computer science",
+                    "net computer science",
+                    "ugc net cse",
+                    "ugc net computer applications",
+                    "ugc net dsa",
+                    "ugc net data structures",
+                    "ugc net data structure and algorithms",
+                    "ugc net algorithms",
+                    "ugc net arrays",
+                    "ugc net dbms",
+                    "ugc net operating system",
+                    "ugc net computer networks",
+                    "ugc net theory of computation",
+                    "ugc net compiler",
+                    "net paper 2 computer science",
+                    "net paper ii computer science",
+                ),
                 syllabus_units=(
                     "Discrete Mathematics and Optimization",
                     "Data Structures and Algorithms",
@@ -756,6 +924,9 @@ class MockTestIntelligenceService:
                     "algorithm",
                     "complexity",
                     "array",
+                    "row-major",
+                    "address",
+                    "index",
                     "stack",
                     "queue",
                     "tree",
@@ -783,6 +954,82 @@ class MockTestIntelligenceService:
                 ),
             ),
             ExamProfile(
+                id="ugc_net_commerce",
+                exam="UGC NET",
+                subject="Commerce",
+                aliases=(
+                    "ugc net commerce",
+                    "net commerce",
+                    "ugc net paper 2 commerce",
+                    "ugc net accounting",
+                    "ugc net business finance",
+                    "ugc net income tax",
+                    "ugc net auditing",
+                ),
+                syllabus_units=(
+                    "Accounting and Auditing",
+                    "Business Finance",
+                    "Income Tax and Corporate Tax Planning",
+                    "Business Economics",
+                    "Business Management",
+                    "Marketing Management",
+                    "Human Resource Management",
+                    "Banking and Financial Institutions",
+                    "International Business",
+                ),
+                question_style="UGC NET Commerce Paper II MCQs with accounting, audit, tax, finance, and management application.",
+                expected_terms=(
+                    "accounting",
+                    "standard",
+                    "audit",
+                    "depreciation",
+                    "ratio",
+                    "working capital",
+                    "tax",
+                    "gst",
+                    "cost",
+                    "variance",
+                    "management",
+                    "marketing",
+                    "finance",
+                ),
+            ),
+            ExamProfile(
+                id="ugc_net_political_science",
+                exam="UGC NET",
+                subject="Political Science",
+                aliases=(
+                    "ugc net political science",
+                    "net political science",
+                    "ugc net polity",
+                    "ugc net paper 2 political science",
+                    "ugc net fundamental rights",
+                ),
+                syllabus_units=(
+                    "Political Theory",
+                    "Indian Constitution",
+                    "Fundamental Rights and Directive Principles",
+                    "Union and State Government",
+                    "Parliament and Judiciary",
+                    "Comparative Politics",
+                    "International Relations",
+                    "Public Administration",
+                ),
+                question_style="UGC NET Political Science Paper II MCQs with constitution, theory, institutions, and statement-based reasoning.",
+                expected_terms=(
+                    "constitution",
+                    "fundamental rights",
+                    "article",
+                    "parliament",
+                    "judiciary",
+                    "federalism",
+                    "rights",
+                    "directive principles",
+                    "governor",
+                    "political theory",
+                ),
+            ),
+            ExamProfile(
                 id="gate_cse",
                 exam="GATE",
                 subject="Computer Science",
@@ -800,7 +1047,35 @@ class MockTestIntelligenceService:
                     "Computer Networks",
                 ),
                 question_style="GATE CSE conceptual and numerical MCQs with precise CS reasoning.",
-                expected_terms=("normalization", "b+ tree", "transaction", "sql", "key", "relation", "locking", "concurrency", "er model", "deadlock", "cache", "dfa", "complexity", "subnet", "pipeline"),
+                expected_terms=(
+                    "normalization",
+                    "b+ tree",
+                    "transaction",
+                    "sql",
+                    "key",
+                    "relation",
+                    "locking",
+                    "concurrency",
+                    "er model",
+                    "deadlock",
+                    "process",
+                    "scheduling",
+                    "paging",
+                    "page fault",
+                    "mutex",
+                    "safe sequence",
+                    "tcp",
+                    "subnet",
+                    "ipv4",
+                    "arp",
+                    "dns",
+                    "osi",
+                    "congestion",
+                    "cache",
+                    "dfa",
+                    "complexity",
+                    "pipeline",
+                ),
             ),
             ExamProfile(
                 id="cyber_security",
@@ -955,13 +1230,52 @@ class MockTestIntelligenceService:
                 expected_terms=("dfa", "nfa", "regular", "cfg", "pda", "turing", "decidable", "parser", "grammar"),
             ),
             ExamProfile(
+                id="school_physics",
+                exam="School",
+                subject="Physics",
+                aliases=(
+                    "school physics",
+                    "class 9 physics",
+                    "class 10 physics",
+                    "class 11 physics",
+                    "class 12 physics",
+                    "cbse physics",
+                    "physics electricity",
+                    "current electricity",
+                    "electricity",
+                    "motion physics",
+                    "light physics",
+                ),
+                syllabus_units=("Motion", "Force and Laws of Motion", "Work and Energy", "Sound", "Light", "Electricity", "Magnetism"),
+                question_style="School Physics MCQs with textbook concepts, formula application, and clean numerical reasoning.",
+                expected_terms=("physics", "force", "acceleration", "energy", "current", "voltage", "resistance", "ohm", "power", "lens", "mirror", "charge", "circuit"),
+            ),
+            ExamProfile(
+                id="school_chemistry",
+                exam="School",
+                subject="Chemistry",
+                aliases=("school chemistry", "class 9 chemistry", "class 10 chemistry", "cbse chemistry", "chemical reactions", "acids bases salts", "carbon compounds"),
+                syllabus_units=("Matter", "Atoms and Molecules", "Chemical Reactions", "Acids Bases and Salts", "Metals and Non-metals", "Carbon and Compounds"),
+                question_style="School Chemistry MCQs with reactions, definitions, and simple application.",
+                expected_terms=("chemistry", "atom", "molecule", "reaction", "acid", "base", "salt", "metal", "carbon", "valency", "oxidation"),
+            ),
+            ExamProfile(
+                id="school_biology",
+                exam="School",
+                subject="Biology",
+                aliases=("school biology", "class 9 biology", "class 10 biology", "cbse biology", "life processes", "photosynthesis", "human biology"),
+                syllabus_units=("Cell Biology", "Life Processes", "Photosynthesis", "Respiration", "Control and Coordination", "Reproduction", "Heredity"),
+                question_style="School Biology MCQs with textbook facts plus process understanding.",
+                expected_terms=("biology", "cell", "photosynthesis", "respiration", "enzyme", "stomata", "xylem", "phloem", "hormone", "reproduction", "heredity"),
+            ),
+            ExamProfile(
                 id="jee_physics",
                 exam="JEE",
                 subject="Physics",
-                aliases=("jee physics", "iit physics", "jee mains physics", "jee advanced physics"),
+                aliases=("jee physics", "iit physics", "jee mains physics", "jee advanced physics", "jee current electricity", "jee electricity", "jee mechanics", "jee optics"),
                 syllabus_units=("Mechanics", "Thermodynamics", "Electrostatics", "Current Electricity", "Magnetism", "Optics", "Modern Physics"),
                 question_style="JEE Physics MCQs with formula application and conceptual reasoning.",
-                expected_terms=("force", "acceleration", "potential", "current", "lens", "momentum", "energy", "field", "wavelength"),
+                expected_terms=("force", "acceleration", "potential", "current", "lens", "momentum", "energy", "field", "charge", "capacitance", "electrostatics", "wavelength"),
             ),
             ExamProfile(
                 id="jee_math",
@@ -982,13 +1296,70 @@ class MockTestIntelligenceService:
                 expected_terms=("mole", "bond", "equilibrium", "enthalpy", "orbital", "reaction", "acid", "base"),
             ),
             ExamProfile(
+                id="neet",
+                exam="NEET",
+                subject="Physics, Chemistry, and Biology",
+                aliases=("neet", "neet ug", "neet mock test", "neet practice test", "neet exam"),
+                syllabus_units=(
+                    "Biology",
+                    "Genetics and Evolution",
+                    "Human Physiology",
+                    "Physics",
+                    "Mechanics",
+                    "Current Electricity",
+                    "Chemistry",
+                    "Chemical Bonding",
+                    "Organic Chemistry",
+                ),
+                question_style="NEET mixed-subject MCQs across Biology, Physics, and Chemistry with NCERT-style concept checks.",
+                expected_terms=(
+                    "biology",
+                    "gene",
+                    "dna",
+                    "mendel",
+                    "cell",
+                    "physiology",
+                    "physics",
+                    "force",
+                    "current",
+                    "resistance",
+                    "energy",
+                    "chemistry",
+                    "mole",
+                    "bond",
+                    "atom",
+                    "reaction",
+                ),
+            ),
+            ExamProfile(
                 id="neet_biology",
                 exam="NEET",
                 subject="Biology",
                 aliases=("neet biology", "neet bio", "neet genetics", "biology genetics", "genetics"),
                 syllabus_units=("Cell Biology", "Genetics and Evolution", "Human Physiology", "Plant Physiology", "Ecology", "Biotechnology"),
                 question_style="NEET Biology fact-plus-concept MCQs aligned with NCERT style.",
-                expected_terms=("gene", "allele", "chromosome", "dna", "rna", "codon", "hormone", "enzyme", "ecosystem", "mendel", "cross", "inheritance", "meiosis", "dominance"),
+                expected_terms=(
+                    "gene",
+                    "allele",
+                    "chromosome",
+                    "dna",
+                    "rna",
+                    "codon",
+                    "hormone",
+                    "enzyme",
+                    "ecosystem",
+                    "mendel",
+                    "cross",
+                    "inheritance",
+                    "meiosis",
+                    "dominance",
+                    "reproduction",
+                    "flower",
+                    "photosynthesis",
+                    "cell",
+                    "blood",
+                    "respiration",
+                ),
             ),
             ExamProfile(
                 id="neet_physics",
@@ -1018,13 +1389,37 @@ class MockTestIntelligenceService:
                 expected_terms=("percentage", "ratio", "profit", "work", "syllogism", "conclusion", "arrangement", "average"),
             ),
             ExamProfile(
+                id="indian_history",
+                exam="",
+                subject="Indian History",
+                aliases=("indian history", "modern history", "history", "class 10 history", "school history", "freedom struggle"),
+                syllabus_units=("Revolt of 1857", "Indian National Congress", "Swadeshi Movement", "Gandhian Movements", "Civil Disobedience", "Quit India Movement"),
+                question_style="Indian history MCQs focused on events, causes, leaders, and consequence-based reasoning.",
+                expected_terms=("history", "congress", "movement", "gandhi", "swaraj", "swadeshi", "quit india", "civil disobedience", "rowlatt", "dandi"),
+            ),
+            ExamProfile(
                 id="upsc_general_studies",
                 exam="UPSC",
                 subject="General Studies",
-                aliases=("upsc polity", "upsc history", "upsc geography", "upsc current affairs", "civil services"),
+                aliases=("upsc polity", "upsc history", "upsc geography", "upsc current affairs", "civil services", "upsc fundamental rights", "polity fundamental rights"),
                 syllabus_units=("Indian Polity", "Modern History", "Geography", "Economy", "Environment", "Science and Technology", "Current Affairs"),
                 question_style="UPSC prelims-style MCQs with statement analysis and factual-conceptual links.",
-                expected_terms=("constitution", "article", "parliament", "monsoon", "governor", "movement", "biodiversity", "inflation"),
+                expected_terms=(
+                    "constitution",
+                    "article",
+                    "parliament",
+                    "monsoon",
+                    "governor",
+                    "movement",
+                    "biodiversity",
+                    "inflation",
+                    "fundamental rights",
+                    "rights",
+                    "directive principles",
+                    "judicial review",
+                    "basic structure",
+                    "polity",
+                ),
             ),
             ExamProfile(
                 id="school_science",
@@ -1048,6 +1443,20 @@ class MockTestIntelligenceService:
 
     def _question_pool(self) -> dict[str, list[dict[str, Any]]]:
         return {
+            "commerce": [
+                self._q("Which accounting standard principle requires inventory to be valued at lower of cost and net realizable value?", ["Prudence principle", "Money measurement only", "Dual aspect only", "Separate entity only"], 0, "Prudence avoids overstating assets; inventory is carried at the lower of cost and net realizable value.", ["accounting", "standard", "inventory"], "medium"),
+                self._q("A machine costs 100000, has residual value 10000, and useful life of 5 years. What is annual straight-line depreciation?", ["18000", "20000", "10000", "22000"], 0, "Straight-line depreciation is (cost - residual value) / useful life = (100000 - 10000) / 5 = 18000.", ["accounting", "depreciation", "commerce"], "medium"),
+                self._q("Which audit evidence is generally considered more reliable?", ["Evidence obtained directly by the auditor from an external party", "Unverified oral explanation only", "A rough internal note", "A cancelled draft invoice"], 0, "External evidence obtained directly by the auditor has stronger reliability than unsupported internal explanations.", ["audit", "evidence", "commerce"], "medium"),
+                self._q("Current ratio is calculated using which formula?", ["Current assets divided by current liabilities", "Net profit divided by sales", "Debt divided by equity", "Sales divided by inventory"], 0, "The current ratio measures short-term liquidity as current assets / current liabilities.", ["ratio", "liquidity", "commerce"], "easy"),
+                self._q("If current assets are 300000 and current liabilities are 150000, what is the current ratio?", ["2:1", "1:2", "1.5:1", "3:1"], 0, "Current ratio equals 300000 / 150000 = 2, so it is 2:1.", ["ratio", "liquidity", "accounting"], "medium"),
+                self._q("In cost accounting, material price variance mainly compares what?", ["Actual price with standard price for actual quantity", "Actual sales with budgeted sales", "Fixed cost with total cost", "Closing stock with opening stock"], 0, "Material price variance isolates the effect of paying a different price than the standard price for the actual quantity purchased or used.", ["cost accounting", "variance"], "hard"),
+                self._q("Which tax is levied on supply of goods and services in India under the GST framework?", ["Goods and Services Tax", "Dividend Distribution Tax", "Wealth Tax", "Securities Transaction Tax only"], 0, "GST is a destination-based indirect tax on supplies of goods and services.", ["gst", "tax", "commerce"], "easy"),
+                self._q("Working capital is best described by which expression?", ["Current assets minus current liabilities", "Fixed assets minus depreciation", "Sales minus gross profit", "Share capital plus reserves only"], 0, "Net working capital represents short-term operating liquidity: current assets less current liabilities.", ["working capital", "finance"], "medium"),
+                self._q("Which capital budgeting method directly discounts future cash flows?", ["Net present value", "Payback period only", "Accounting rate of return", "Simple average profit"], 0, "NPV discounts expected cash flows at the required rate and subtracts initial investment.", ["finance", "npv", "capital budgeting"], "medium"),
+                self._q("In break-even analysis, contribution is calculated as what?", ["Sales minus variable cost", "Sales minus fixed cost only", "Fixed cost divided by price", "Profit plus tax only"], 0, "Contribution is the amount left after variable costs to cover fixed costs and profit.", ["cost accounting", "break even"], "medium"),
+                self._q("Consider a firm with sales 800000, variable cost 500000, and fixed cost 200000. What is the profit?", ["100000", "300000", "200000", "500000"], 0, "Profit equals sales - variable cost - fixed cost = 800000 - 500000 - 200000 = 100000.", ["cost accounting", "profit", "commerce"], "hard"),
+                self._q("Which management function involves comparing actual performance with planned standards?", ["Controlling", "Staffing", "Directing only", "Forecasting only"], 0, "Controlling measures actual performance against standards and initiates corrective action.", ["management", "control"], "medium"),
+            ],
             "cyber": [
                 self._q("Calculate ALE when SLE is 5000 and ARO is 0.20 for a cyber security asset.", ["1000", "5200", "25000", "0.04"], 0, "Annualized Loss Expectancy is SLE x ARO, so 5000 x 0.20 = 1000.", ["cyber security", "risk", "ale"], "medium"),
                 self._q("A firewall blocks 45 malicious requests out of 50. Determine the detection rate.", ["90%", "45%", "10%", "5%"], 0, "The firewall detection rate is 45 / 50 = 0.90, or 90%.", ["firewall", "cyber security", "security metrics"], "medium"),
@@ -1080,6 +1489,20 @@ class MockTestIntelligenceService:
                 self._q("Which value of x satisfies 3x ≡ 1 (mod 7)?", ["5", "2", "3", "6"], 0, "3 x 5 = 15, and 15 mod 7 leaves remainder 1.", ["modular arithmetic", "inverse"], "hard"),
                 self._q("A bag has 4 red and 6 blue balls. If 2 balls are drawn without replacement, what is the probability both are red?", ["2/15", "4/25", "1/5", "8/45"], 0, "The probability is (4/10) x (3/9) = 12/90 = 2/15.", ["probability", "combination"], "hard"),
                 self._q("A connected planar graph has 6 vertices and 9 edges. How many faces does it have?", ["5", "3", "4", "6"], 0, "Euler's formula gives V - E + F = 2, so F = 2 - 6 + 9 = 5.", ["planar graph", "euler formula"], "hard"),
+            ],
+            "array": [
+                self._q("For a 0-based one-dimensional array A with base address 1000 and element size 4 bytes, what is the address of A[5]?", ["1020", "1005", "1016", "1040"], 0, "The address is base + index x element size = 1000 + 5 x 4 = 1020.", ["array", "address", "index"], "medium"),
+                self._q("In row-major storage of a 2D array A[10][20], which element lies immediately after A[3][19]?", ["A[4][0]", "A[3][20]", "A[2][19]", "A[4][19]"], 0, "Row-major order stores all columns of a row before moving to the next row, so A[4][0] follows A[3][19].", ["array", "row-major"], "medium"),
+                self._q("Which operation is O(n) in the worst case for an unsorted static array?", ["Deleting an element after searching for its value", "Accessing A[i] by index", "Reading the first element", "Computing the base address"], 0, "The value must first be searched linearly; shifting may also be needed depending on order preservation.", ["array", "time complexity"], "medium"),
+                self._q("Direct concept check: why does array indexing take O(1) time in a contiguous array?", ["The target address is computed arithmetically", "Every prior element is traversed", "A hash function is always used", "The array is stored as a linked list"], 0, "Contiguous storage allows base + offset calculation without scanning earlier elements.", ["array", "random access"], "easy"),
+                self._q("For a sorted array of 31 elements, what is the maximum number of successful binary-search comparisons?", ["5", "31", "15", "6"], 0, "Binary search needs ceil(log2(31 + 1)) = 5 comparisons in the worst successful case.", ["array", "binary search", "complexity"], "medium"),
+                self._q("Which situation makes insertion into an array at position k require shifting elements?", ["When order after position k must be preserved", "When only A[0] is read", "When element size is one byte", "When the array is already full of zeros"], 0, "To preserve order, elements from k onward must move right before the new item is placed.", ["array", "insertion"], "medium"),
+                self._q("Consider an array implementation of a circular queue with front = 7, rear = 2, capacity = 10, using one empty slot to distinguish full from empty. How many elements are present?", ["5", "6", "4", "9"], 0, "The count is (rear - front + capacity) mod capacity = (2 - 7 + 10) mod 10 = 5.", ["array", "circular queue"], "hard"),
+                self._q("In column-major storage of a 2D array with 1-based bounds A[1..4][1..5], which index changes fastest in memory?", ["The row index", "The column index", "Neither index", "Both indexes alternate randomly"], 0, "Column-major order stores a complete column contiguously, so the row index changes fastest.", ["array", "column-major"], "hard"),
+                self._q("A dynamic array doubles capacity whenever full. What is the amortized insertion cost at the end?", ["O(1)", "O(log n)", "O(n)", "O(n log n)"], 0, "Occasional O(n) resizing is spread over many O(1) appends, giving amortized constant time.", ["dynamic array", "amortized"], "hard"),
+                self._q("Which prefix-sum expression gives the sum of A[l..r] when P[i] stores A[0] through A[i-1]?", ["P[r + 1] - P[l]", "P[r] - P[l]", "P[l] - P[r + 1]", "P[r + 1] + P[l]"], 0, "With an exclusive prefix array, P[r+1] includes through r and P[l] excludes before l.", ["array", "prefix sum"], "hard"),
+                self._q("What is the worst-case time to find the first occurrence of x in an unsorted array of n elements?", ["O(n)", "O(log n)", "O(1)", "O(n log n)"], 0, "Without ordering or indexing, each element may need to be checked once.", ["array", "linear search"], "easy"),
+                self._q("Which representation is usually more space-efficient for a sparse matrix than a full 2D array?", ["Triples storing row, column, and value", "A second full zero matrix", "Only the diagonal length", "A stack of all zero entries"], 0, "Sparse matrix triples store only non-zero values and their coordinates.", ["array", "sparse matrix"], "medium"),
             ],
             "data": [
                 self._q("Which data structure gives O(1) average-time lookup by key?", ["Hash table", "Stack", "Queue", "Sorted linked list"], 0, "A hash table maps keys to buckets, so lookup is O(1) on average when collisions are controlled.", ["hashing", "data structures"]),
@@ -1137,16 +1560,44 @@ class MockTestIntelligenceService:
                 self._q("Which deadlock condition means a resource cannot be forcibly taken from a process?", ["No preemption", "Mutual exclusion", "Hold and wait", "Circular wait"], 0, "No preemption says resources are released only voluntarily, one of Coffman's deadlock conditions.", ["deadlock", "os"]),
                 self._q("In paging, what does a page fault indicate?", ["The referenced page is not currently in main memory", "The CPU cache is full", "A process completed normally", "The disk has no file system"], 0, "A page fault occurs when the needed virtual page must be brought into RAM.", ["paging", "memory"]),
                 self._q("Which synchronization primitive can be used to protect a critical section?", ["Mutex", "Spooler", "Loader", "Assembler"], 0, "A mutex allows only one thread or process to enter a critical section at a time.", ["synchronization", "mutex"]),
+                self._q("Which CPU scheduling algorithm can cause starvation when lower-priority processes wait indefinitely?", ["Priority scheduling", "Round robin with fixed quantum", "FCFS only", "Shortest queue routing"], 0, "Priority scheduling may starve low-priority processes unless aging or a similar technique is used.", ["scheduling", "starvation", "os"], "medium"),
+                self._q("Banker's algorithm is used primarily for what?", ["Deadlock avoidance", "Page replacement", "Disk formatting", "File compression"], 0, "Banker's algorithm checks safe states before allocation to avoid deadlock.", ["deadlock", "bankers algorithm"], "medium"),
+                self._q("In a system with available vector (3, 3, 2), Banker's algorithm checks whether what exists?", ["A safe sequence", "A page table index only", "A socket connection", "A compiler token stream"], 0, "The algorithm determines whether processes can finish in some safe order with available resources.", ["deadlock", "safe sequence"], "hard"),
+                self._q("Which page replacement policy removes the page that will not be used for the longest future time?", ["Optimal replacement", "FIFO", "Round robin", "Shortest seek time first"], 0, "Optimal page replacement is theoretical and replaces the page whose next use is farthest in the future.", ["paging", "replacement"], "medium"),
+                self._q("If a process holds one resource and waits for another, which deadlock condition is involved?", ["Hold and wait", "No preemption only", "Mutual exclusion only", "Bounded waiting"], 0, "Hold and wait means a process keeps allocated resources while requesting more.", ["deadlock", "hold and wait"], "easy"),
+                self._q("Which mechanism maps virtual page numbers to physical frame numbers?", ["Page table", "Ready queue", "Semaphore table", "File descriptor only"], 0, "The page table stores mappings from virtual pages to physical frames.", ["paging", "page table"], "medium"),
+                self._q("Which disk scheduling algorithm services the closest pending request first?", ["SSTF", "FCFS", "Round robin", "LRU"], 0, "Shortest Seek Time First chooses the pending request requiring the least head movement.", ["disk scheduling", "sstf"], "medium"),
+                self._q("Consider three processes with burst times 4, 6, and 10 ms under FCFS. What is the average waiting time if they arrive together in that order?", ["14/3 ms", "20/3 ms", "10 ms", "0 ms"], 0, "Waiting times are 0, 4, and 10 ms, so the average is (0 + 4 + 10) / 3 = 14/3 ms.", ["process", "scheduling", "os"], "hard"),
+                self._q("Determine the number of page frames needed if a process has 16 KB logical address space and page size is 4 KB.", ["4 pages", "2 pages", "8 pages", "64 pages"], 0, "Number of pages equals address space divided by page size: 16 KB / 4 KB = 4.", ["paging", "process", "memory"], "medium"),
             ],
             "network": [
                 self._q("Which transport protocol provides reliable, ordered byte-stream delivery?", ["TCP", "UDP", "IP", "ARP"], 0, "TCP adds sequencing, acknowledgements, and retransmission for reliable ordered delivery.", ["tcp", "transport"]),
                 self._q("Which device primarily forwards packets using IP addresses?", ["Router", "Repeater", "Hub", "NIC"], 0, "Routers use network-layer IP addresses to choose next hops between networks.", ["routing", "ip"]),
                 self._q("What does subnetting primarily help achieve?", ["Dividing an IP network into smaller logical networks", "Encrypting every packet", "Replacing TCP", "Increasing MAC address length"], 0, "Subnetting borrows host bits to create smaller networks and manage routing/address allocation.", ["subnet", "ip"]),
+                self._q("In IPv4, a /24 network leaves how many host bits?", ["8", "24", "16", "32"], 0, "IPv4 has 32 bits, so /24 leaves 8 host bits.", ["subnet", "ipv4"], "medium"),
+                self._q("Which OSI layer is responsible for end-to-end process communication using ports?", ["Transport layer", "Physical layer", "Data link layer", "Presentation layer only"], 0, "The transport layer uses ports and protocols such as TCP or UDP for process-to-process delivery.", ["transport", "osi", "ports"], "medium"),
+                self._q("What does ARP resolve on an IPv4 LAN?", ["IP address to MAC address", "Domain name to IP address", "Port to process id", "Ciphertext to plaintext"], 0, "ARP maps an IPv4 address to a link-layer MAC address on the local network.", ["arp", "mac", "network"], "medium"),
+                self._q("Which protocol is commonly used to translate domain names to IP addresses?", ["DNS", "SMTP", "SSH", "ICMP"], 0, "DNS resolves human-readable domain names into IP addresses.", ["dns", "application layer"], "easy"),
+                self._q("If a subnet mask is 255.255.255.0, what is the prefix length?", ["/24", "/16", "/8", "/32"], 0, "Three 255 octets represent 24 network bits.", ["subnet", "mask"], "easy"),
+                self._q("Which congestion-control behavior reduces TCP's congestion window after packet loss?", ["Multiplicative decrease", "Address resolution", "Static routing only", "Name caching"], 0, "TCP congestion control backs off the congestion window after detecting loss.", ["tcp", "congestion"], "hard"),
             ],
             "theory": [
                 self._q("Which machine model recognizes exactly the regular languages?", ["Finite automaton", "Turing machine only", "Pushdown automaton only", "Linear bounded automaton only"], 0, "DFA and NFA finite automata are equivalent recognizers for regular languages.", ["dfa", "regular language"]),
                 self._q("Which grammar class is accepted by a pushdown automaton?", ["Context-free grammar", "Regular expression only", "Unrestricted grammar only", "Attribute grammar only"], 0, "Pushdown automata use a stack and accept context-free languages.", ["pda", "cfg"]),
                 self._q("In compiler design, lexical analysis mainly produces what?", ["Tokens", "Machine code", "Parse trees only", "Register allocation"], 0, "The lexer scans characters and groups them into tokens for the parser.", ["compiler", "lexer"]),
+            ],
+            "biology": [
+                self._q("Which cell organelle is called the powerhouse of the cell?", ["Mitochondria", "Ribosome", "Nucleus only", "Cell wall"], 0, "Mitochondria release energy through cellular respiration and produce ATP.", ["biology", "cell", "mitochondria"], "easy"),
+                self._q("Which pigment captures light energy during photosynthesis?", ["Chlorophyll", "Haemoglobin", "Keratin", "Insulin"], 0, "Chlorophyll in chloroplasts absorbs light energy for photosynthesis.", ["photosynthesis", "chlorophyll", "biology"], "easy"),
+                self._q("What is the main function of xylem in plants?", ["Transporting water and minerals", "Transporting prepared food only", "Making hormones", "Producing gametes"], 0, "Xylem carries water and dissolved minerals from roots to other plant parts.", ["xylem", "transport", "biology"], "medium"),
+                self._q("Which openings in leaves regulate gas exchange for photosynthesis?", ["Stomata", "Root hairs", "Sepals", "Anthers"], 0, "Stomata are pores that allow exchange of carbon dioxide, oxygen, and water vapor.", ["stomata", "photosynthesis", "biology"], "medium"),
+                self._q("Which enzyme in saliva begins digestion of starch?", ["Amylase", "Pepsin", "Trypsin", "Lipase only"], 0, "Salivary amylase starts breaking starch into simpler sugars in the mouth.", ["enzyme", "digestion", "biology"], "easy"),
+                self._q("In human blood, which cells mainly transport oxygen?", ["Red blood cells", "Platelets", "White blood cells", "Plasma proteins only"], 0, "Red blood cells contain haemoglobin, which binds and transports oxygen.", ["respiration", "blood", "biology"], "medium"),
+                self._q("Why does the rate of photosynthesis fall when carbon dioxide becomes limiting?", ["Carbon dioxide is a raw material for glucose formation", "Carbon dioxide destroys chlorophyll", "Carbon dioxide blocks stomata permanently", "Carbon dioxide turns light into heat"], 0, "Photosynthesis uses carbon dioxide to build glucose, so a shortage limits the process.", ["photosynthesis", "carbon dioxide", "biology"], "hard"),
+                self._q("Which hormone lowers blood glucose level in humans?", ["Insulin", "Adrenaline", "Thyroxine", "Growth hormone"], 0, "Insulin helps cells take up glucose and lowers blood glucose concentration.", ["hormone", "insulin", "biology"], "medium"),
+                self._q("Which part of a flower produces pollen grains?", ["Anther", "Stigma", "Ovary", "Sepal"], 0, "The anther is part of the stamen and produces pollen grains.", ["reproduction", "flower", "biology"], "easy"),
+                self._q("A plant is kept in darkness for two days before a starch test. What is the main purpose?", ["To destarch the leaves", "To kill chlorophyll", "To increase transpiration", "To close roots permanently"], 0, "Keeping a plant in darkness uses stored starch, so new starch formation can be tested.", ["photosynthesis", "starch", "biology"], "hard"),
+                self._q("Which type of reproduction creates offspring genetically identical to the parent?", ["Asexual reproduction", "Sexual reproduction", "Cross-pollination only", "Fertilization only"], 0, "Asexual reproduction uses one parent and usually produces genetically identical offspring.", ["reproduction", "heredity", "biology"], "medium"),
             ],
             "genetics": [
                 self._q("In a monohybrid cross of two heterozygous plants, what phenotypic ratio is expected under complete dominance?", ["3:1", "1:1", "9:3:3:1", "2:1"], 0, "Aa x Aa gives three dominant phenotype offspring for every one recessive phenotype.", ["genetics", "mendel"]),
@@ -1161,14 +1612,46 @@ class MockTestIntelligenceService:
                 self._q("A test cross is usually performed with which genotype?", ["Homozygous recessive", "Homozygous dominant", "Heterozygous dominant only", "Polygenic dominant"], 0, "Crossing with a homozygous recessive individual reveals the unknown genotype.", ["test cross", "genetics"]),
             ],
             "physics": [
+                self._q("Calculate the electrostatic force expression for charges +2 uC and +3 uC separated by 0.3 m.", ["k(2 x 10^-6)(3 x 10^-6)/(0.3)^2", "k(2 + 3)/(0.3)", "k(0.3)^2/(6 x 10^-12)", "k(2 x 10^-6)/(3 x 10^-6)"], 0, "Coulomb's law gives F = k q1 q2 / r^2 using charges in coulombs and distance in meters.", ["electrostatics", "force", "charge"], "hard"),
+                self._q("Calculate the electric field magnitude when a 4 uC charge experiences force 0.2 N.", ["50000 N/C", "0.8 N/C", "5 x 10^-5 N/C", "200000 N/C"], 0, "Electric field E = F/q = 0.2 / (4 x 10^-6) = 50000 N/C.", ["electric field", "electrostatics", "charge"], "hard"),
+                self._q("Calculate the work needed to move 2 C charge through an electric potential difference of 12 V.", ["24 J", "6 J", "14 J", "10 J"], 0, "Work equals qV, so 2 x 12 = 24 J.", ["potential", "work", "electrostatics"], "medium"),
+                self._q("Calculate the charge stored by a 5 uF capacitor connected to 10 V.", ["50 uC", "2 uC", "15 uC", "0.5 uC"], 0, "Charge on a capacitor is Q = CV = 5 uF x 10 V = 50 uC.", ["capacitance", "charge", "electrostatics"], "medium"),
+                self._q("Determine the equivalent capacitance of two identical 6 uF capacitors connected in series.", ["3 uF", "12 uF", "6 uF", "36 uF"], 0, "For two equal capacitors in series, equivalent capacitance is C/2 = 3 uF.", ["capacitance", "series", "electrostatics"], "hard"),
+                self._q("Which statement is correct for electric field lines?", ["They start on positive charges and end on negative charges", "They always form closed loops in electrostatics", "They cross wherever field is strong", "They point from lower to higher potential only"], 0, "Electrostatic field lines originate on positive charge and terminate on negative charge or infinity.", ["electric field", "field lines", "electrostatics"], "medium"),
+                self._q("Determine the fraction of electric field magnitude when distance from a point charge is doubled.", ["One-fourth", "One-half", "Double", "Four times"], 0, "For a point charge, E is proportional to 1/r^2, so doubling r reduces E to one-fourth.", ["electric field", "inverse square", "electrostatics"], "medium"),
+                self._q("Calculate the equivalent capacitance of 2 uF and 4 uF capacitors connected in parallel.", ["6 uF", "2 uF", "4/3 uF", "8 uF"], 0, "Capacitances in parallel add directly, so 2 uF + 4 uF = 6 uF.", ["capacitance", "parallel", "electrostatics"], "medium"),
+                self._q("Calculate the potential at a point 0.2 m from a +5 uC charge.", ["k(5 x 10^-6)/0.2", "k(0.2)/(5 x 10^-6)", "k(5 x 10^-6)(0.2)^2", "5 x 10^-6/k"], 0, "Potential due to a point charge is V = kq/r.", ["potential", "charge", "electrostatics"], "hard"),
+                self._q("Determine the energy stored in a 4 uF capacitor charged to 100 V.", ["0.02 J", "0.2 J", "2 J", "400 J"], 0, "Energy is 1/2 CV^2 = 0.5 x 4 x 10^-6 x 10000 = 0.02 J.", ["capacitance", "energy", "electrostatics"], "hard"),
+                self._q("Calculate the electric flux through a surface when E = 200 N/C, area = 0.5 m^2, and the field is normal to the surface.", ["100 N m^2/C", "400 N m^2/C", "0.0025 N m^2/C", "200.5 N m^2/C"], 0, "Flux is EA cos 0 = 200 x 0.5 = 100 N m^2/C.", ["electric field", "flux", "electrostatics"], "hard"),
+                self._q("Determine the force on a 3 uC charge placed in a uniform electric field of 4000 N/C.", ["0.012 N", "12 N", "1.33 N", "0.0013 N"], 0, "Force is qE = 3 x 10^-6 x 4000 = 0.012 N.", ["electric field", "force", "electrostatics"], "medium"),
                 self._q("If net force on a body is doubled while mass is constant, what happens to acceleration?", ["It doubles", "It halves", "It becomes zero", "It remains unchanged"], 0, "Newton's second law gives a = F/m, so acceleration is directly proportional to net force.", ["force", "acceleration"]),
                 self._q("Ohm's law relates potential difference V, current I, and resistance R as which equation?", ["V = IR", "I = VR", "R = VI", "V = I/R"], 0, "Ohm's law states that voltage across a conductor equals current times resistance.", ["current", "resistance"]),
                 self._q("For a convex lens, an object placed beyond 2F forms which kind of image?", ["Real, inverted, and diminished", "Virtual, erect, and enlarged", "Real, erect, and same size", "Virtual and diminished"], 0, "A convex lens forms a real, inverted, diminished image between F and 2F for objects beyond 2F.", ["optics", "lens"]),
+                self._q("A circuit has a 6 V battery connected to a 3 ohm resistor. What current flows through the resistor?", ["2 A", "0.5 A", "9 A", "18 A"], 0, "Using Ohm's law I = V/R, the current is 6/3 = 2 A.", ["electricity", "current", "ohm"], "medium"),
+                self._q("Two resistors of 2 ohm and 4 ohm are connected in series. What is their equivalent resistance?", ["6 ohm", "2 ohm", "8 ohm", "4/3 ohm"], 0, "Resistances in series add directly, so 2 + 4 = 6 ohm.", ["electricity", "resistance", "series"], "medium"),
+                self._q("Two identical 6 ohm resistors are connected in parallel. What is the equivalent resistance?", ["3 ohm", "6 ohm", "12 ohm", "1 ohm"], 0, "For two equal resistors in parallel, equivalent resistance is half of one resistor, so 3 ohm.", ["electricity", "parallel", "resistance"], "medium"),
+                self._q("An electric bulb draws 0.5 A from a 220 V supply. What is its power?", ["110 W", "220 W", "440 W", "0.002 W"], 0, "Electric power is P = VI, so 220 x 0.5 = 110 W.", ["electricity", "power", "current"], "medium"),
+                self._q("Which device is used to measure electric current in a circuit?", ["Ammeter", "Voltmeter", "Galvanometer only for voltage", "Barometer"], 0, "An ammeter is connected in series to measure current in a circuit.", ["electricity", "current", "ammeter"], "easy"),
+                self._q("A wire's resistance increases when which physical change is made?", ["Its length is increased", "Its length is decreased to zero", "Its area is increased", "It is replaced by a perfect conductor"], 0, "Resistance is directly proportional to length and inversely proportional to cross-sectional area.", ["electricity", "resistance", "wire"], "medium"),
+                self._q("If three 3 ohm resistors are connected in parallel, what is the equivalent resistance?", ["1 ohm", "3 ohm", "6 ohm", "9 ohm"], 0, "For three equal resistors R in parallel, equivalent resistance is R/3, so 3/3 = 1 ohm.", ["electricity", "parallel", "resistance"], "hard"),
+                self._q("A 60 W bulb runs for 5 hours. How much electrical energy does it consume?", ["0.30 kWh", "300 kWh", "12 kWh", "65 kWh"], 0, "Energy in kWh is power in kW multiplied by time: 0.060 x 5 = 0.30 kWh.", ["electricity", "energy", "power"], "hard"),
+                self._q("A charge of 30 C passes through a conductor in 5 s. What is the current?", ["6 A", "150 A", "25 A", "0.17 A"], 0, "Current is charge per unit time, so I = Q/t = 30/5 = 6 A.", ["electricity", "charge", "current"], "medium"),
+                self._q("Why is a voltmeter connected in parallel across a component?", ["It measures potential difference across the component", "It must carry the full circuit current", "It lowers the battery voltage to zero", "It replaces the component"], 0, "Voltage is measured between two points, so a voltmeter is placed in parallel across the component.", ["electricity", "voltage", "circuit"], "easy"),
+                self._q("A ray of light going from air to glass bends toward the normal mainly because what changes?", ["Its speed decreases", "Its frequency becomes zero", "Its mass increases", "Its wavelength becomes infinite"], 0, "Light slows down in a denser medium like glass, causing refraction toward the normal.", ["light", "refraction", "physics"], "medium"),
+                self._q("A 2 kg object moving at 3 m/s has kinetic energy equal to what?", ["9 J", "6 J", "3 J", "18 J"], 0, "Kinetic energy is 1/2 mv^2 = 1/2 x 2 x 3^2 = 9 J.", ["energy", "motion", "physics"], "medium"),
             ],
             "chemistry": [
                 self._q("What is the number of particles in one mole of a substance?", ["6.022 x 10^23", "3.14 x 10^8", "9.8", "1.6 x 10^-19"], 0, "Avogadro's constant gives 6.022 x 10^23 particles per mole.", ["mole", "avogadro"]),
                 self._q("Which bond generally forms by sharing electron pairs?", ["Covalent bond", "Ionic bond", "Metallic bond only", "Hydrogen bond only"], 0, "A covalent bond forms when atoms share electron pairs to complete valence shells.", ["bond", "covalent"]),
                 self._q("For an exothermic reaction, what is the sign of enthalpy change?", ["Negative", "Positive", "Zero always", "Undefined"], 0, "Exothermic reactions release heat, so products have lower enthalpy and delta H is negative.", ["enthalpy", "thermodynamics"]),
+                self._q("Which gas is usually released when an acid reacts with a metal carbonate?", ["Carbon dioxide", "Hydrogen", "Oxygen", "Nitrogen"], 0, "Acids react with metal carbonates to form salt, water, and carbon dioxide.", ["acid", "carbonate", "chemistry"], "easy"),
+                self._q("What is the pH nature of a solution with pH 3?", ["Acidic", "Basic", "Neutral", "Saturated"], 0, "Solutions with pH below 7 are acidic.", ["acid", "base", "ph"], "easy"),
+                self._q("In a balanced chemical equation, what must be equal on both sides?", ["Number of atoms of each element", "Number of words", "Only number of molecules", "Only state symbols"], 0, "The law of conservation of mass requires equal atoms of every element on both sides.", ["chemical reaction", "balancing"], "medium"),
+                self._q("Which process coats iron with zinc to prevent rusting?", ["Galvanization", "Distillation", "Sublimation", "Crystallization"], 0, "Galvanization protects iron by coating it with zinc.", ["metal", "corrosion", "chemistry"], "medium"),
+                self._q("Which carbon compound functional group is present in ethanol?", ["Alcohol group", "Carboxylic acid group", "Aldehyde group", "Ketone group"], 0, "Ethanol contains the hydroxyl alcohol functional group.", ["carbon", "alcohol", "chemistry"], "medium"),
+                self._q("During oxidation of copper powder in air, what compound is formed?", ["Copper oxide", "Copper sulphate", "Copper carbonate", "Copper chloride"], 0, "Copper reacts with oxygen on heating to form black copper oxide.", ["oxidation", "copper", "chemistry"], "medium"),
+                self._q("A neutralization reaction between HCl and NaOH forms which products?", ["NaCl and water", "Hydrogen and oxygen", "Carbon dioxide and salt", "Sodium and chlorine gas"], 0, "An acid and base neutralize to form a salt and water; here the salt is NaCl.", ["acid", "base", "salt"], "medium"),
+                self._q("Which statement best explains why ionic compounds conduct electricity when molten?", ["Their ions can move freely", "Their molecules become neutral", "Their electrons disappear", "Their crystals become lighter"], 0, "Molten ionic compounds conduct because mobile ions carry charge.", ["ionic", "electricity", "chemistry"], "hard"),
             ],
             "math": [
                 self._q("If f(x)=x^2, what is f'(x)?", ["2x", "x", "x^3", "2"], 0, "Using the power rule, d(x^2)/dx = 2x.", ["derivative", "calculus"]),
@@ -1229,10 +1712,28 @@ class MockTestIntelligenceService:
                 self._q("Which part of the Indian Constitution contains Fundamental Rights?", ["Part III", "Part IV", "Part II", "Part IX"], 0, "Fundamental Rights are listed in Part III of the Indian Constitution.", ["constitution", "fundamental rights"]),
                 self._q("Who is the constitutional head of a State in India?", ["Governor", "Chief Minister", "Speaker", "Advocate General"], 0, "The Governor is the constitutional head of the State executive.", ["governor", "polity"]),
                 self._q("Which body is responsible for conducting elections to Parliament in India?", ["Election Commission of India", "Finance Commission", "NITI Aayog", "Lok Sabha Secretariat"], 0, "The Election Commission of India conducts and supervises parliamentary elections.", ["election", "constitution"]),
+                self._q("Article 19 of the Indian Constitution primarily protects which category of rights?", ["Freedom rights", "Religious tax exemptions only", "Directive Principles", "Emergency powers"], 0, "Article 19 protects freedoms such as speech, assembly, association, movement, residence, and profession.", ["article 19", "fundamental rights"], "medium"),
+                self._q("Which writ is issued to produce a detained person before a court?", ["Habeas corpus", "Mandamus", "Certiorari", "Quo warranto"], 0, "Habeas corpus protects personal liberty by requiring production of a detained person before court.", ["writ", "rights", "judiciary"], "medium"),
+                self._q("Directive Principles of State Policy are mainly contained in which part?", ["Part IV", "Part III", "Part V", "Part IXA"], 0, "DPSPs are non-justiciable governance principles listed in Part IV.", ["directive principles", "constitution"], "easy"),
+                self._q("Which doctrine means Parliament cannot destroy the essential features of the Constitution?", ["Basic structure doctrine", "Collective responsibility", "Double jeopardy", "Lame duck doctrine"], 0, "The basic structure doctrine limits constitutional amendments that damage essential constitutional features.", ["basic structure", "constitution"], "medium"),
+                self._q("Which article is directly associated with abolition of untouchability?", ["Article 17", "Article 14", "Article 21", "Article 32"], 0, "Article 17 abolishes untouchability and forbids its practice in any form.", ["article 17", "fundamental rights"], "easy"),
+                self._q("Consider a law that unreasonably restricts peaceful assembly. Which Fundamental Right is most directly affected?", ["Freedom under Article 19", "Right against exploitation only", "Cultural rights only", "Directive Principles only"], 0, "Peaceful assembly is part of the freedoms protected under Article 19, subject to reasonable restrictions.", ["article 19", "assembly", "rights"], "hard"),
+                self._q("Which institution has the power of judicial review over laws violating Fundamental Rights?", ["Supreme Court and High Courts", "Election Commission only", "Finance Commission only", "Comptroller and Auditor General only"], 0, "The Supreme Court and High Courts can review laws and enforce Fundamental Rights through writ jurisdiction.", ["judicial review", "rights"], "medium"),
+                self._q("Fundamental Duties were added to the Constitution by which amendment?", ["42nd Amendment", "44th Amendment", "1st Amendment", "73rd Amendment"], 0, "The 42nd Amendment inserted Fundamental Duties into Part IVA.", ["fundamental duties", "amendment"], "medium"),
             ],
             "history": [
                 self._q("The Non-Cooperation Movement was launched after which major event?", ["Jallianwala Bagh massacre and Khilafat issue", "Partition of Bengal only", "Quit India resolution", "Dandi March"], 0, "The movement followed anger over Jallianwala Bagh and the Khilafat question.", ["modern history", "non cooperation"]),
                 self._q("Who founded the Indian National Congress in 1885?", ["A. O. Hume", "M. G. Ranade", "Dadabhai Naoroji", "Gopal Krishna Gokhale"], 0, "A. O. Hume helped found the Indian National Congress in 1885.", ["history", "congress"]),
+                self._q("The Dandi March was directly associated with protest against which tax?", ["Salt tax", "Land revenue only", "Income tax", "Textile tax"], 0, "Gandhi's Dandi March challenged the British monopoly and tax on salt.", ["history", "dandi march", "salt"], "easy"),
+                self._q("Which 1905 event intensified the Swadeshi Movement in Bengal?", ["Partition of Bengal", "Champaran Satyagraha", "Cripps Mission", "Cabinet Mission"], 0, "The 1905 Partition of Bengal sparked boycott and Swadeshi protests.", ["history", "swadeshi", "bengal"], "medium"),
+                self._q("The Quit India Movement was launched in which year?", ["1942", "1930", "1919", "1947"], 0, "The All India Congress Committee launched Quit India in August 1942.", ["history", "quit india"], "easy"),
+                self._q("Which act is associated with the Rowlatt Satyagraha?", ["Rowlatt Act", "Government of India Act 1935", "Indian Councils Act 1861", "Pitt's India Act"], 0, "The Rowlatt Act allowed detention without trial and triggered nationwide protest.", ["history", "rowlatt act"], "medium"),
+                self._q("Who led the Revolt of 1857 at Jhansi?", ["Rani Lakshmibai", "Begum Hazrat Mahal", "Sarojini Naidu", "Annie Besant"], 0, "Rani Lakshmibai became the prominent leader of resistance at Jhansi.", ["history", "1857", "jhansi"], "easy"),
+                self._q("Which organization was formed by Bal Gangadhar Tilak and Annie Besant to demand self-government?", ["Home Rule League", "Ghadar Party", "Servants of India Society", "Forward Bloc"], 0, "Tilak and Annie Besant led Home Rule Leagues to campaign for self-government.", ["history", "home rule"], "medium"),
+                self._q("The Poona Pact of 1932 was mainly between Gandhi and which leader?", ["B. R. Ambedkar", "Subhas Chandra Bose", "Jawaharlal Nehru", "Sardar Patel"], 0, "The Poona Pact was an agreement between Gandhi and Ambedkar on reserved seats.", ["history", "poona pact"], "medium"),
+                self._q("Which session of Congress declared Poorna Swaraj as the goal?", ["Lahore Session 1929", "Surat Session 1907", "Calcutta Session 1886", "Tripuri Session 1939"], 0, "The Lahore Session of 1929 adopted Poorna Swaraj as the objective.", ["history", "poorna swaraj"], "medium"),
+                self._q("Why was the Chauri Chaura incident significant for the Non-Cooperation Movement?", ["It led Gandhi to withdraw the movement", "It started the Salt March", "It created the Indian National Congress", "It ended the Rowlatt Act"], 0, "After violence at Chauri Chaura, Gandhi withdrew the Non-Cooperation Movement.", ["history", "chauri chaura"], "hard"),
+                self._q("Which statement best distinguishes Civil Disobedience from Non-Cooperation?", ["Civil Disobedience openly broke specific laws like salt laws", "Civil Disobedience avoided all public protest", "Non-Cooperation began after the Dandi March", "Both were only armed movements"], 0, "Civil Disobedience involved deliberate violation of unjust laws, most famously the salt law.", ["history", "civil disobedience"], "hard"),
             ],
             "geography": [
                 self._q("The southwest monsoon in India is primarily caused by what?", ["Seasonal pressure difference between land and sea", "Earthquake activity", "Ocean salinity only", "Tidal friction"], 0, "Differential heating creates pressure gradients that drive moisture-laden monsoon winds.", ["monsoon", "geography"]),
@@ -1241,6 +1742,14 @@ class MockTestIntelligenceService:
             "science": [
                 self._q("Which organelle is known as the powerhouse of the cell?", ["Mitochondria", "Ribosome", "Golgi body", "Lysosome"], 0, "Mitochondria produce ATP through cellular respiration.", ["cell", "mitochondria"]),
                 self._q("Which process converts glucose into energy in cells?", ["Respiration", "Photosynthesis", "Osmosis", "Transpiration"], 0, "Cellular respiration breaks down glucose to release usable energy.", ["respiration", "life processes"]),
+                self._q("Which form of energy is stored in a stretched rubber band?", ["Elastic potential energy", "Chemical energy", "Nuclear energy", "Sound energy"], 0, "A stretched rubber band stores energy due to deformation, called elastic potential energy.", ["energy", "physics", "science"], "easy"),
+                self._q("Which separation method is best for separating sand from water?", ["Filtration", "Evaporation only", "Sublimation", "Chromatography only"], 0, "Filtration separates an insoluble solid such as sand from a liquid.", ["matter", "separation", "science"], "easy"),
+                self._q("Which gas is needed by plants for photosynthesis?", ["Carbon dioxide", "Nitrogen", "Hydrogen", "Helium"], 0, "Plants use carbon dioxide and water to make glucose during photosynthesis.", ["photosynthesis", "biology", "science"], "easy"),
+                self._q("What happens to current if voltage is doubled while resistance stays constant?", ["Current doubles", "Current halves", "Current becomes zero", "Current stays unchanged"], 0, "Ohm's law gives I = V/R, so doubling voltage doubles current when resistance is constant.", ["electricity", "current", "science"], "medium"),
+                self._q("Which acid is naturally present in lemon juice?", ["Citric acid", "Hydrochloric acid", "Sulfuric acid", "Nitric acid"], 0, "Lemon juice contains citric acid, giving it a sour taste.", ["acid", "chemistry", "science"], "easy"),
+                self._q("Why does a pencil partly immersed in water appear bent?", ["Refraction of light", "Reflection only", "Evaporation", "Magnetism"], 0, "Light changes direction when it passes between water and air, causing apparent bending.", ["light", "refraction", "science"], "medium"),
+                self._q("Which blood component helps in clotting after injury?", ["Platelets", "Red blood cells", "Plasma water only", "Haemoglobin"], 0, "Platelets help form clots and stop bleeding at injury sites.", ["blood", "biology", "science"], "medium"),
+                self._q("A metal spoon feels colder than a wooden spoon at the same room temperature because metal does what faster?", ["Conducts heat away from the hand", "Produces cold energy", "Absorbs oxygen", "Stops conduction"], 0, "Metal is a better conductor and removes heat from the hand more quickly.", ["heat", "conduction", "science"], "medium"),
             ],
         }
 

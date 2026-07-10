@@ -24,19 +24,27 @@ CEREBRAS_PRO_MODELS = [
     "qwen-3-235b-a22b-instruct-2507",
 ]
 
-# NVIDIA Build catalog "Free Endpoint" chat models, checked May 21, 2026.
-# Only chat-completions compatible models are exposed here; media, embedding,
-# rerank, TTS, safety, and smoke-test failing endpoints are intentionally hidden.
+# NVIDIA Build catalog chat-completions models, checked July 5, 2026.
+# Only endpoints that passed a live smoke test are exposed here; EOL, timed-out,
+# account-unavailable, media, embedding, rerank, TTS, and safety endpoints stay hidden.
 NVIDIA_FAST_MODELS = [
-    "google/gemma-3n-e2b-it",
-    "google/gemma-3n-e4b-it",
+    "nvidia/llama-3.1-nemotron-nano-8b-v1",
+    "mistralai/ministral-14b-instruct-2512",
     "microsoft/phi-4-multimodal-instruct",
-    "abacusai/dracarys-llama-3.1-70b-instruct",
+    "mistralai/mixtral-8x7b-instruct-v0.1",
+    "mistralai/mistral-small-4-119b-2603",
 ]
 
 NVIDIA_PRO_MODELS = [
-    "qwen/qwen3-coder-480b-a35b-instruct",
+    "mistralai/mistral-large-3-675b-instruct-2512",
     "meta/llama-4-maverick-17b-128e-instruct",
+    "moonshotai/kimi-k2.6",
+    "deepseek-ai/deepseek-v4-flash",
+    "qwen/qwen3-next-80b-a3b-instruct",
+    "nvidia/llama-3.3-nemotron-super-49b-v1",
+    "mistralai/mistral-medium-3.5-128b",
+    "mistralai/mistral-nemotron",
+    "abacusai/dracarys-llama-3.1-70b-instruct",
 ]
 
 NVIDIA_FREE_CHAT_MODEL_IDS = frozenset([*NVIDIA_FAST_MODELS, *NVIDIA_PRO_MODELS])

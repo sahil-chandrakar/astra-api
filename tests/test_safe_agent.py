@@ -66,7 +66,50 @@ class FakeSearchService:
         return self.sources[:max_results], []
 
 
-def build_service(tmp_path, desktop: DesktopActionService | None = None, llm_response=_MISSING_LLM_RESPONSE, cerebras_api_key: str = "", search=None):
+class FakeFormFillerService:
+    def __init__(self, tmp_path):
+        self.browser_profile_dir = tmp_path / "form-browser"
+        self.browser_profile_dir.mkdir(parents=True, exist_ok=True)
+        self.preview_calls: list[dict] = []
+        self.fill_calls: list[dict] = []
+
+    async def preview(self, params: dict):
+        self.preview_calls.append(params)
+        fill_params = {
+            "url": params.get("url") or "https://example.com/contact",
+            "task": params.get("task", ""),
+            "field_values": {"full_name": "Sahil", "email": "sahil@example.com"},
+        }
+        preview = {
+            "url": fill_params["url"],
+            "title": "Contact",
+            "fields": [
+                {"key": "full_name", "label": "Full name", "control_type": "text", "required": True},
+                {"key": "email", "label": "Email", "control_type": "text", "required": True},
+                {"key": "password", "label": "Password", "control_type": "text", "required": False, "sensitive": True, "blocked_reason": "sensitive field"},
+            ],
+            "field_values": fill_params["field_values"],
+            "missing_required": [],
+            "blocked_fields": [{"key": "password", "label": "Password", "reason": "sensitive field"}],
+            "warnings": ["Astra will fill only. It will not submit or click final action buttons."],
+            "detected_count": 3,
+            "mapped_count": 2,
+        }
+        return True, "Review the detected form values before Astra fills the page.", {"preview": preview, "params": fill_params}
+
+    async def fill(self, params: dict):
+        self.fill_calls.append(params)
+        return True, "Filled 2 field(s). Review the browser page and submit manually if everything looks right.", {"form_fill_result": {"filled": [{"key": "full_name"}, {"key": "email"}], "submit_blocked": True}}
+
+
+def build_service(
+    tmp_path,
+    desktop: DesktopActionService | None = None,
+    llm_response=_MISSING_LLM_RESPONSE,
+    cerebras_api_key: str = "",
+    search=None,
+    form_filler=None,
+):
     settings = Settings(
         data_dir=str(tmp_path / "data"),
         reports_dir=str(tmp_path / "reports"),
@@ -79,7 +122,17 @@ def build_service(tmp_path, desktop: DesktopActionService | None = None, llm_res
     llm = FakeLlmService(settings, llm_response) if llm_response is not _MISSING_LLM_RESPONSE else LlmService(settings)
     study = StudyService(settings, reports, documents, llm)
     mock_tests = MockTestService(settings, llm, documents, search)
-    service = SafeAgentService(settings, reports, memory, documents, study, mock_tests, desktop or DesktopActionService(), VoiceService(settings))
+    service = SafeAgentService(
+        settings,
+        reports,
+        memory,
+        documents,
+        study,
+        mock_tests,
+        desktop or DesktopActionService(),
+        VoiceService(settings),
+        form_filler=form_filler,
+    )
     return service, memory, documents, study, mock_tests
 
 
@@ -145,6 +198,105 @@ async def test_confirm_commands_require_confirmation_then_execute(tmp_path):
     assert first.outcome == "confirmation_required"
     assert second.outcome == "success"
     assert memory.list_items()[0].text == "DBMS exam next week"
+
+
+@pytest.mark.asyncio
+async def test_form_fill_prompt_previews_before_filling(tmp_path):
+    form_filler = FakeFormFillerService(tmp_path)
+    service, _, _, _, _ = build_service(tmp_path, form_filler=form_filler)
+
+    response = await service.handle_natural_language(
+        "fill contact form https://example.com/contact name is Sahil, email is sahil@example.com"
+    )
+
+    assert response is not None
+    assert response.command_id == "fill_web_form"
+    assert response.outcome == "confirmation_required"
+    assert response.confirmation_required is True
+    assert response.params["url"] == "https://example.com/contact"
+    assert response.params["field_values"]["email"] == "sahil@example.com"
+    assert response.data["form_fill_preview"]["blocked_fields"][0]["label"] == "Password"
+    assert form_filler.preview_calls
+    assert form_filler.fill_calls == []
+
+
+@pytest.mark.asyncio
+async def test_youtube_login_prompt_routes_to_form_fill_without_media_automation_intent(tmp_path):
+    form_filler = FakeFormFillerService(tmp_path)
+    service, _, _, _, _ = build_service(tmp_path, form_filler=form_filler)
+
+    response = await service.handle_natural_language("open youtube login page with dummy data")
+
+    assert response is not None
+    assert response.command_id == "fill_web_form"
+    assert response.outcome == "confirmation_required"
+    assert form_filler.preview_calls[0]["task"] == "open youtube login page with dummy data"
+
+
+@pytest.mark.asyncio
+async def test_youtube_create_account_prompt_routes_to_form_fill(tmp_path):
+    form_filler = FakeFormFillerService(tmp_path)
+    service, _, _, _, _ = build_service(tmp_path, form_filler=form_filler)
+
+    response = await service.handle_natural_language("create youtube account with dummy data")
+
+    assert response is not None
+    assert response.command_id == "fill_web_form"
+    assert response.outcome == "confirmation_required"
+    assert form_filler.preview_calls[0]["task"] == "create youtube account with dummy data"
+
+
+@pytest.mark.asyncio
+async def test_common_site_login_and_signup_prompts_route_to_form_fill(tmp_path):
+    form_filler = FakeFormFillerService(tmp_path)
+    service, _, _, _, _ = build_service(tmp_path, form_filler=form_filler)
+
+    login_response = await service.handle_natural_language("open github login with dummy data")
+    signup_response = await service.handle_natural_language("create amazon account with dummy data")
+
+    assert login_response is not None
+    assert login_response.command_id == "fill_web_form"
+    assert signup_response is not None
+    assert signup_response.command_id == "fill_web_form"
+    assert form_filler.preview_calls[0]["site_query"] == "github login dummy data"
+    assert form_filler.preview_calls[1]["site_query"] == "create amazon account dummy data"
+
+
+@pytest.mark.asyncio
+async def test_form_continue_prompt_resumes_current_form_session(tmp_path):
+    form_filler = FakeFormFillerService(tmp_path)
+    service, _, _, _, _ = build_service(tmp_path, form_filler=form_filler)
+
+    response = await service.handle_natural_language("continue form after I handled captcha")
+
+    assert response is not None
+    assert response.command_id == "fill_web_form"
+    assert response.outcome == "confirmation_required"
+    assert form_filler.preview_calls[0]["continue_current"] is True
+    assert "site_query" not in form_filler.preview_calls[0]
+
+
+@pytest.mark.asyncio
+async def test_confirmed_form_fill_uses_reviewed_values_and_never_submits(tmp_path):
+    form_filler = FakeFormFillerService(tmp_path)
+    service, _, _, _, _ = build_service(tmp_path, form_filler=form_filler)
+    request = AgentCommandRequest(
+        command_id="fill_web_form",
+        input_text="fill contact form",
+        confirmed=True,
+        params={
+            "url": "https://example.com/contact",
+            "task": "fill contact form",
+            "field_values": {"full_name": "Sahil Khan", "email": "sahil@example.com"},
+        },
+    )
+
+    response = await service.execute(request)
+
+    assert response.outcome == "success"
+    assert form_filler.preview_calls == []
+    assert form_filler.fill_calls[0]["field_values"]["full_name"] == "Sahil Khan"
+    assert response.data["form_fill_result"]["submit_blocked"] is True
 
 
 @pytest.mark.asyncio
@@ -445,6 +597,126 @@ async def test_mock_test_command_requires_confirmation_then_generates_default_mc
 
 
 @pytest.mark.asyncio
+async def test_mock_test_parser_extracts_school_exam_count_difficulty_and_duration(tmp_path):
+    service, _, _, _, _ = build_service(tmp_path)
+
+    response = await service.handle_natural_language(
+        "Create a class 10 physics mock test on electricity with 5 MCQs, medium difficulty, 10 minutes"
+    )
+
+    assert response is not None
+    assert response.outcome == "confirmation_required"
+    assert response.command_id == "generate_mock_test"
+    assert response.params["topic"] == "electricity"
+    assert response.params["exam"] == "Class 10"
+    assert response.params["subject"] == "Physics"
+    assert response.params["question_count"] == 5
+    assert response.params["difficulty"] == "medium"
+    assert response.params["duration_minutes"] == 10
+    assert response.params["source_query"] == "electricity"
+
+
+@pytest.mark.asyncio
+async def test_semantic_llm_malformed_mock_command_id_is_repaired_by_intent(tmp_path):
+    payload = (
+        '{"command_id":"generate_mock_repl","intent":"generate_mock_test",'
+        '"topic":"class 10 physics electricity","exam":"Class 10","subject":"Physics",'
+        '"question_count":5,"difficulty":"medium","duration_minutes":10,'
+        '"requires_sources":false,"source_requirement":"none","source_mode":"uploaded_docs",'
+        '"source_query":"class 10 physics electricity","constraints":[],"is_new_creation":true,'
+        '"is_existing_item_request":false,"confidence":0.9,"matched_alias":"generate mock repl",'
+        '"reason":"The user wants a new mock test."}'
+    )
+    service, _, _, _, _ = build_service(tmp_path, llm_response=payload, cerebras_api_key="test-key")
+
+    response = await service.handle_natural_language(
+        "Create a class 10 physics mock test on electricity with 5 MCQs, medium difficulty, 10 minutes"
+    )
+
+    assert response is not None
+    assert response.outcome == "confirmation_required"
+    assert response.command_id == "generate_mock_test"
+    assert response.params["topic"] == "electricity"
+
+
+@pytest.mark.asyncio
+async def test_configured_llm_does_not_delay_known_school_physics_profile(tmp_path):
+    _, _, _, _, mock_tests = build_service(tmp_path, llm_response="not valid question json", cerebras_api_key="test-key")
+
+    test, setup = await mock_tests.generate(MockTestGenerateRequest(topic="class 10 physics electricity", question_count=5))
+
+    assert setup == []
+    assert test.question_count == 5
+    assert test.subject == "Physics"
+    assert test.generation_mode == "profile_based"
+    assert test.quality_score == 1.0
+    assert mock_tests.llm.calls == []  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_mcq_only_prompt_routes_to_mock_test_not_study_notes(tmp_path):
+    service, _, _, _, mock_tests = build_service(tmp_path)
+
+    first = await service.handle_natural_language("Make 8 hard MCQs for Python OOP in 15 minutes")
+
+    assert first is not None
+    assert first.outcome == "confirmation_required"
+    assert first.command_id == "generate_mock_test"
+    assert first.params["topic"] == "Python OOP"
+    assert first.params["question_count"] == 8
+    assert first.params["difficulty"] == "hard"
+    assert first.params["duration_minutes"] == 15
+
+    second = await service.execute(
+        AgentCommandRequest(
+            command_id=first.command_id,
+            input_text=first.audit.input_text if first.audit else "Make 8 hard MCQs for Python OOP in 15 minutes",
+            params=first.params,
+            confirmed=True,
+            resolution=first.resolution,
+        )
+    )
+
+    assert second.outcome == "success"
+    test = mock_tests.list_tests()[0]
+    assert test.subject == "Python Programming"
+    assert test.question_count == 8
+    assert all(question.difficulty == "hard" for question in test.questions)
+
+
+@pytest.mark.asyncio
+async def test_numerical_question_prompt_keeps_constraint_and_generates_profile(tmp_path):
+    service, _, _, _, mock_tests = build_service(tmp_path)
+
+    first = await service.handle_natural_language("give me some numerical questions on cyber security 10 mcqs hard level 20 minutes")
+
+    assert first is not None
+    assert first.outcome == "confirmation_required"
+    assert first.command_id == "generate_mock_test"
+    assert first.params["topic"] == "cyber security"
+    assert first.params["question_count"] == 10
+    assert first.params["difficulty"] == "hard"
+    assert first.params["duration_minutes"] == 20
+    assert "numerical questions" in first.params["constraints"]
+
+    second = await service.execute(
+        AgentCommandRequest(
+            command_id=first.command_id,
+            input_text=first.audit.input_text if first.audit else "give me numerical cyber security questions",
+            params=first.params,
+            confirmed=True,
+            resolution=first.resolution,
+        )
+    )
+
+    assert second.outcome == "success"
+    test = mock_tests.list_tests()[0]
+    assert test.subject == "Cyber Security"
+    assert test.generation_mode == "profile_based"
+    assert all(any(char.isdigit() for char in " ".join([question.prompt, *question.options])) for question in test.questions)
+
+
+@pytest.mark.asyncio
 async def test_mock_test_status_complaint_opens_existing_test_without_generation(tmp_path):
     service, _, _, _, mock_tests = build_service(tmp_path)
     existing, _ = await mock_tests.generate(MockTestGenerateRequest(topic="dsa"))
@@ -497,6 +769,83 @@ async def test_semantic_parser_understands_ugc_net_cs_pyq_mock_request(tmp_path)
     assert response.params["source_requirement"] == "pyq_required"
     assert "PYQ required" in response.params["constraints"]
     assert response.resolution["source"] == "semantic_local"
+
+
+@pytest.mark.asyncio
+async def test_semantic_parser_keeps_ugc_net_paper_two_dsa_array_focus(tmp_path):
+    service, _, _, _, _ = build_service(tmp_path)
+
+    response = await service.handle_natural_language(
+        "create mock test on ugc net data structure and algorithm (paper 2) - array question real pyq styles"
+    )
+
+    assert response is not None
+    assert response.outcome == "confirmation_required"
+    assert response.command_id == "generate_mock_test"
+    assert response.params["exam"] == "UGC NET"
+    assert response.params["subject"] == "Computer Science"
+    assert response.params["topic"] == "Data Structures and Algorithms - Arrays"
+    assert response.params["source_requirement"] == "none"
+    assert "PYQ-style practice" in response.params["constraints"]
+
+
+@pytest.mark.asyncio
+async def test_llm_payload_cannot_drop_ugc_net_dsa_array_focus_or_invent_duration(tmp_path):
+    payload = (
+        '{"command_id":"generate_mock_test","intent":"generate_mock_test",'
+        '"topic":"UGC NET Data Structures and Algorithms","exam":"UGC NET",'
+        '"subject":"Computer Science","question_count":30,"difficulty":"mixed","mode":"mcq",'
+        '"duration_minutes":120,"requires_sources":false,"source_requirement":"none",'
+        '"source_mode":"uploaded_docs","source_query":"UGC NET Data Structure and Algorithm PYQs",'
+        '"constraints":["real PYQ style"],"is_new_creation":true,"is_existing_item_request":false,'
+        '"confidence":0.95,"matched_alias":"create mock test","reason":"user wants mock test"}'
+    )
+    service, _, _, _, _ = build_service(tmp_path, cerebras_api_key="test-key", llm_response=payload)
+
+    response = await service.handle_natural_language(
+        "create mock test on ugc net data structure and algorithm (paper 2) - array question real pyq styles"
+    )
+
+    assert response is not None
+    assert response.outcome == "confirmation_required"
+    assert response.command_id == "generate_mock_test"
+    assert response.params["exam"] == "UGC NET"
+    assert response.params["subject"] == "Computer Science"
+    assert response.params["topic"] == "Data Structures and Algorithms - Arrays"
+    assert response.params["question_count"] == 10
+    assert response.params["duration_minutes"] == 20
+    assert response.params["source_requirement"] == "none"
+    assert response.params["source_query"] == "Data Structures and Algorithms - Arrays"
+    assert "PYQ-style practice" in response.params["constraints"]
+
+
+@pytest.mark.asyncio
+async def test_semantic_parser_uses_paper_two_subject_without_falling_to_paper_one(tmp_path):
+    service, _, _, _, _ = build_service(tmp_path)
+
+    response = await service.handle_natural_language("create ugc net history paper 2 mock test on modern india hard level")
+
+    assert response is not None
+    assert response.outcome == "confirmation_required"
+    assert response.params["exam"] == "UGC NET"
+    assert response.params["subject"] == "History"
+    assert response.params["topic"] == "modern india"
+    assert response.params["difficulty"] == "hard"
+
+
+@pytest.mark.asyncio
+async def test_semantic_parser_preserves_paper_one_when_asked_explicitly(tmp_path):
+    service, _, _, _, _ = build_service(tmp_path)
+
+    response = await service.handle_natural_language("generate ugc net paper 1 teaching aptitude mock test pyq style")
+
+    assert response is not None
+    assert response.outcome == "confirmation_required"
+    assert response.params["exam"] == "UGC NET"
+    assert response.params["subject"] == "Paper I: Teaching and Research Aptitude"
+    assert response.params["topic"] == "teaching aptitude"
+    assert response.params["source_requirement"] == "none"
+    assert "PYQ-style practice" in response.params["constraints"]
 
 
 @pytest.mark.asyncio
@@ -716,6 +1065,151 @@ async def test_pyq_style_ugc_net_generates_cs_questions_without_fake_pyq_sources
 
 
 @pytest.mark.asyncio
+async def test_ugc_net_cs_array_topic_generates_focused_array_questions_without_llm(tmp_path):
+    _, _, _, _, mock_tests = build_service(tmp_path)
+
+    test, setup = await mock_tests.generate(
+        MockTestGenerateRequest(
+            topic="Data Structures and Algorithms - Arrays",
+            exam="UGC NET",
+            subject="Computer Science",
+            constraints=["PYQ-style practice"],
+            question_count=10,
+        )
+    )
+
+    prompts = " ".join(question.prompt.lower() for question in test.questions)
+    unique_prompts = {question.prompt.lower() for question in test.questions}
+    assert setup == []
+    assert test.exam == "UGC NET"
+    assert test.subject == "Computer Science"
+    assert test.generation_mode == "pyq_style"
+    assert test.quality_score == 1.0
+    assert len(unique_prompts) == len(test.questions)
+    assert any(term in prompts for term in ["row-major", "prefix", "dynamic array", "binary-search", "binary search"])
+    assert all(
+        any(term in question.prompt.lower() for term in ["array", "row-major", "column-major", "prefix", "sparse", "circular queue", "binary-search", "binary search"])
+        for question in test.questions
+    )
+    assert "teaching aptitude" not in prompts
+    assert "research aptitude" not in prompts
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("prompt", "expected"),
+    [
+        (
+            "create ugc net commerce paper 2 mock test on accounting standards hard level",
+            {"exam": "UGC NET", "subject": "Commerce", "topic": "accounting standards", "difficulty": "hard"},
+        ),
+        (
+            "make ugc net political science paper 2 mock test on fundamental rights pyq style",
+            {"exam": "UGC NET", "subject": "Political Science", "topic": "fundamental rights", "source_requirement": "none"},
+        ),
+        (
+            "creat ugc net papr 2 computer science arrays pyq stile",
+            {"exam": "UGC NET", "subject": "Computer Science", "topic": "Data Structures and Algorithms - Arrays", "source_requirement": "none"},
+        ),
+        (
+            "generate ugc net paper 1 research aptitude 8 mcqs medium 15 minutes",
+            {
+                "exam": "UGC NET",
+                "subject": "Paper I: Teaching and Research Aptitude",
+                "topic": "research aptitude",
+                "question_count": 8,
+                "difficulty": "medium",
+                "duration_minutes": 15,
+            },
+        ),
+        (
+            "create gate cse operating system deadlock hard 12 questions 25 minutes",
+            {"exam": "GATE", "subject": "Computer Science", "topic": "operating system deadlock", "question_count": 12, "difficulty": "hard"},
+        ),
+        (
+            "genrate gate cse cn subnetting 5 mcqs",
+            {"exam": "GATE", "subject": "Computer Science", "topic": "cn subnetting", "question_count": 5},
+        ),
+        (
+            "create jee mains physics electrostatics numerical 10 questions hard",
+            {"exam": "JEE", "subject": "Physics", "topic": "electrostatics", "difficulty": "hard"},
+        ),
+        (
+            "test me on neet biology genetics 6 mcqs",
+            {"exam": "NEET", "subject": "Biology", "topic": "genetics", "question_count": 6},
+        ),
+        (
+            "creat class 10 phyics electricity 7 mcq medium 12 min",
+            {"exam": "Class 10", "subject": "Physics", "topic": "electricity", "question_count": 7, "difficulty": "medium", "duration_minutes": 12},
+        ),
+        (
+            "make 8 hard MCQs for Python OOP in 15 minutes",
+            {"subject": "Python Programming", "topic": "Python OOP", "question_count": 8, "difficulty": "hard", "duration_minutes": 15},
+        ),
+    ],
+)
+async def test_adversarial_mock_prompt_matrix_extracts_clean_confirmation_params(tmp_path, prompt, expected):
+    service, _, _, _, _ = build_service(tmp_path)
+
+    response = await service.handle_natural_language(prompt)
+
+    assert response is not None
+    assert response.outcome == "confirmation_required"
+    assert response.command_id == "generate_mock_test"
+    for key, value in expected.items():
+        assert response.params[key] == value
+
+
+@pytest.mark.asyncio
+async def test_adversarial_mock_generation_matrix_stays_unique_and_topic_relevant_without_llm(tmp_path):
+    service, _, _, _, mock_tests = build_service(tmp_path)
+    cases = [
+        ("create ugc net commerce paper 2 mock test on accounting standards hard level", 10, ["accounting", "audit", "depreciation", "ratio"]),
+        ("make ugc net political science paper 2 mock test on fundamental rights pyq style", 10, ["fundamental rights", "article", "constitution", "writ"]),
+        ("creat ugc net papr 2 computer science arrays pyq stile", 10, ["array", "row-major", "prefix", "sparse"]),
+        ("generate ugc net paper 1 research aptitude 8 mcqs medium 15 minutes", 8, ["research", "hypothesis", "sampling"]),
+        ("create gate cse operating system deadlock hard 12 questions 25 minutes", 12, ["deadlock", "paging", "process", "scheduling"]),
+        ("genrate gate cse cn subnetting 5 mcqs", 5, ["subnet", "ipv4", "arp", "dns"]),
+        ("create jee mains physics electrostatics numerical 10 questions hard", 10, ["charge", "electric field", "capacitance", "potential"]),
+        ("test me on neet biology genetics 6 mcqs", 6, ["dna", "codon", "allele", "mendel"]),
+        ("create upsc polity fundamental rights statement based mock test", 10, ["fundamental rights", "article", "constitution", "judicial review"]),
+        ("creat class 10 phyics electricity 7 mcq medium 12 min", 7, ["current", "resistance", "ohm", "voltage"]),
+        ("make 8 hard MCQs for Python OOP in 15 minutes", 8, ["class", "object", "lambda", "mutable"]),
+    ]
+    seen_test_ids: set[str] = set()
+
+    for prompt, expected_count, relevance_terms in cases:
+        first = await service.handle_natural_language(prompt)
+        assert first is not None
+        assert first.outcome == "confirmation_required"
+        second = await service.execute(
+            AgentCommandRequest(
+                command_id=first.command_id,
+                input_text=prompt,
+                params=first.params,
+                confirmed=True,
+                resolution=first.resolution,
+            )
+        )
+
+        assert second.outcome == "success", second.message
+        new_tests = [item for item in mock_tests.list_tests() if item.id not in seen_test_ids]
+        assert len(new_tests) == 1
+        generated = new_tests[0]
+        seen_test_ids.add(generated.id)
+        prompts = [question.prompt.lower() for question in generated.questions]
+        combined = " ".join(
+            " ".join([question.prompt, *question.options, *question.tags]).lower()
+            for question in generated.questions
+        )
+        assert generated.question_count == expected_count
+        assert len(generated.questions) == expected_count
+        assert len(set(prompts)) == len(prompts)
+        assert "core purpose" not in combined
+        assert any(term in combined for term in relevance_terms)
+
+
+@pytest.mark.asyncio
 async def test_generic_ugc_net_pyq_style_uses_paper_one_profile_without_cerebras(tmp_path):
     service, _, _, _, mock_tests = build_service(tmp_path)
 
@@ -774,6 +1268,58 @@ async def test_neet_biology_genetics_uses_biology_blueprint(tmp_path):
     assert test.generation_mode == "profile_based"
     assert any(term in prompts for term in ["monohybrid", "codon", "dna", "allele"])
     assert "prioritize first" not in prompts
+
+
+@pytest.mark.asyncio
+async def test_plain_neet_generates_mixed_profile_without_llm(tmp_path):
+    _, _, _, _, mock_tests = build_service(tmp_path)
+
+    test, setup = await mock_tests.generate(MockTestGenerateRequest(topic="NEET", exam="NEET", duration_minutes=30))
+
+    combined = " ".join(
+        " ".join([question.prompt, *question.options, *question.tags]).lower()
+        for question in test.questions
+    )
+    assert setup == []
+    assert test.exam == "NEET"
+    assert test.subject == "Physics, Chemistry, and Biology"
+    assert test.duration_minutes == 30
+    assert test.generation_mode == "profile_based"
+    assert test.question_count == 10
+    assert any(term in combined for term in ["dna", "cell", "current", "resistance", "mole", "bond"])
+    assert "core purpose" not in combined
+
+
+@pytest.mark.asyncio
+async def test_plain_neet_prompt_with_30_minutes_creates_mock_test(tmp_path):
+    service, _, _, _, mock_tests = build_service(tmp_path)
+
+    first = await service.handle_natural_language("create quiz on neet in 30 minutes")
+
+    assert first is not None
+    assert first.outcome == "confirmation_required"
+    assert first.command_id == "generate_mock_test"
+    assert first.params["exam"] == "NEET"
+    assert first.params["topic"] == "neet"
+    assert first.params["question_count"] == 10
+    assert first.params["duration_minutes"] == 30
+
+    second = await service.execute(
+        AgentCommandRequest(
+            command_id=first.command_id,
+            input_text=first.audit.input_text if first.audit else "create quiz on neet in 30 minutes",
+            params=first.params,
+            confirmed=True,
+            resolution=first.resolution,
+        )
+    )
+
+    assert second.outcome == "success", second.message
+    test = mock_tests.list_tests()[0]
+    assert test.exam == "NEET"
+    assert test.subject == "Physics, Chemistry, and Biology"
+    assert test.duration_minutes == 30
+    assert test.question_count == 10
 
 
 @pytest.mark.asyncio

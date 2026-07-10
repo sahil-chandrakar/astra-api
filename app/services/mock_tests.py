@@ -129,7 +129,23 @@ class MockTestService:
             source_refs = self._dedupe_sources([*source_refs, *blueprint.sources])
             source = blueprint.generation_mode
 
-            if llm_configured:
+            if blueprint.blueprint_source.startswith("profile:"):
+                candidate_questions = self.intelligence.profile_questions(clean, blueprint)
+                accepted, score, warnings = self.intelligence.validator.validate(
+                    candidate_questions,
+                    blueprint,
+                    clean.question_count,
+                    strict_terms=bool(blueprint.expected_terms),
+                    requested_difficulty=clean.difficulty,
+                    constraints=clean.constraints,
+                )
+                if len(accepted) >= clean.question_count:
+                    questions = self._renumber_questions(accepted)
+                    quality_score = score
+                    quality_warnings = warnings
+                    source = blueprint.generation_mode
+
+            if len(questions) < clean.question_count and llm_configured:
                 candidate_questions: list[MockQuestion] = []
                 best_accepted: list[MockQuestion] = []
                 rejected_reasons: list[str] = []

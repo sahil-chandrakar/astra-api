@@ -3,7 +3,7 @@ import asyncio
 import pytest
 
 from app.config import Settings
-from app.models import AutomationRun, ChatResponse, CommandRequest, LlmProfileConfig, LlmSettingsUpdateRequest, ResearchRequest
+from app.models import AgentCommandResponse, AutomationRun, ChatResponse, CommandRequest, LlmProfileConfig, LlmSettingsUpdateRequest, ResearchRequest
 from app.services.agents import AstraAgentSystem
 from app.services.commands import CommandService
 from app.services.desktop import DesktopActionService
@@ -52,12 +52,23 @@ class EmptySafeAgent:
         return None
 
 
+class RecordingSafeAgent:
+    def __init__(self, response=None):
+        self.calls: list[str] = []
+        self.response = response
+
+    async def handle_natural_language(self, text: str, confirmed: bool = False):
+        self.calls.append(text)
+        return self.response
+
+
 class FakeAutomationService:
     def __init__(self):
         self.prompts: list[str] = []
 
     def can_handle_agent_prompt(self, prompt: str) -> bool:
-        return "downloaded" in prompt.lower()
+        normalized = prompt.lower()
+        return "downloaded" in normalized or "youtube" in normalized or "you tube" in normalized
 
     async def start_run(self, request):
         self.prompts.append(request.prompt)
@@ -115,9 +126,10 @@ def test_llm_settings_restrict_nvidia_to_free_chat_models(tmp_path):
     nvidia = next(provider for provider in llm.provider_statuses() if provider.id == "nvidia")
 
     assert set(nvidia.models) == NVIDIA_FREE_CHAT_MODEL_IDS
-    assert "deepseek-ai/deepseek-v4-flash" not in nvidia.models
-    assert "z-ai/glm5.1" not in nvidia.models
-    assert "moonshotai/kimi-k2.6" not in nvidia.models
+    assert "qwen/qwen3-coder-480b-a35b-instruct" not in nvidia.models
+    assert "google/gemma-3n-e2b-it" not in nvidia.models
+    assert "google/gemma-3n-e4b-it" not in nvidia.models
+    assert "z-ai/glm-5.2" not in nvidia.models
 
 
 def test_llm_settings_restrict_nvidia_models_by_profile(tmp_path):
@@ -150,7 +162,7 @@ def test_llm_settings_migrates_removed_nvidia_model_to_valid_nvidia_default(tmp_
     llm = LlmService(settings)
     llm.llm_settings_path.parent.mkdir(parents=True, exist_ok=True)
     llm.llm_settings_path.write_text(
-        '{"profiles":{"pro":{"provider":"nvidia","model":"mistralai/mistral-large-3-675b-instruct-2512"}}}',
+        '{"profiles":{"pro":{"provider":"nvidia","model":"qwen/qwen3-coder-480b-a35b-instruct"}}}',
         encoding="utf-8",
     )
 
@@ -245,6 +257,79 @@ async def test_agent_mode_delegates_artifact_task_to_automation_runtime(tmp_path
     assert response.automation_run.id == "automation-test"
     assert automation.prompts == ["play that downloaded song in vlc"]
     assert recorder.models == []
+
+
+@pytest.mark.asyncio
+async def test_agent_mode_routes_youtube_media_to_automation_before_safe_open(tmp_path):
+    settings = Settings(data_dir=str(tmp_path / "data"), reports_dir=str(tmp_path / "reports"), piper_cache_dir=str(tmp_path / "piper"))
+    agent_system = AstraAgentSystem(settings)
+    recorder = RecordingLlm()
+    agent_system.llm = recorder  # type: ignore[assignment]
+    automation = FakeAutomationService()
+    safe_agent = RecordingSafeAgent()
+    service = CommandService(agent_system, DesktopActionService(), object(), safe_agent, automation_service=automation)  # type: ignore[arg-type]
+
+    response = await service.handle(CommandRequest(text="open youtube and search for codewithharry latest video", mode="agents"))
+
+    assert response.intent == "agent_plan"
+    assert response.suggested_mode == "sources"
+    assert response.automation_run is not None
+    assert automation.prompts == ["open youtube and search for codewithharry latest video"]
+    assert safe_agent.calls == []
+
+
+@pytest.mark.asyncio
+async def test_agent_mode_routes_youtube_login_to_safe_form_flow_not_automation(tmp_path):
+    settings = Settings(data_dir=str(tmp_path / "data"), reports_dir=str(tmp_path / "reports"), piper_cache_dir=str(tmp_path / "piper"))
+    agent_system = AstraAgentSystem(settings)
+    recorder = RecordingLlm()
+    agent_system.llm = recorder  # type: ignore[assignment]
+    form_response = AgentCommandResponse(
+        command_id="fill_web_form",
+        label="Fill Web Form",
+        risk="safe_confirm",
+        outcome="confirmation_required",
+        message="Review the detected form values before Astra fills the page.",
+        confirmation_required=True,
+    )
+    automation = FakeAutomationService()
+    safe_agent = RecordingSafeAgent(form_response)
+    service = CommandService(agent_system, DesktopActionService(), object(), safe_agent, automation_service=automation)  # type: ignore[arg-type]
+
+    response = await service.handle(CommandRequest(text="open youtube login page with dummy data", mode="agents"))
+
+    assert response.intent == "agent_command"
+    assert response.agent_command is not None
+    assert response.agent_command.command_id == "fill_web_form"
+    assert automation.prompts == []
+    assert safe_agent.calls == ["open youtube login page with dummy data"]
+
+
+@pytest.mark.asyncio
+async def test_agent_mode_routes_youtube_create_account_to_safe_form_flow_not_automation(tmp_path):
+    settings = Settings(data_dir=str(tmp_path / "data"), reports_dir=str(tmp_path / "reports"), piper_cache_dir=str(tmp_path / "piper"))
+    agent_system = AstraAgentSystem(settings)
+    recorder = RecordingLlm()
+    agent_system.llm = recorder  # type: ignore[assignment]
+    form_response = AgentCommandResponse(
+        command_id="fill_web_form",
+        label="Fill Web Form",
+        risk="safe_confirm",
+        outcome="confirmation_required",
+        message="Review the detected form values before Astra fills the page.",
+        confirmation_required=True,
+    )
+    automation = FakeAutomationService()
+    safe_agent = RecordingSafeAgent(form_response)
+    service = CommandService(agent_system, DesktopActionService(), object(), safe_agent, automation_service=automation)  # type: ignore[arg-type]
+
+    response = await service.handle(CommandRequest(text="create youtube account with dummy data", mode="agents"))
+
+    assert response.intent == "agent_command"
+    assert response.agent_command is not None
+    assert response.agent_command.command_id == "fill_web_form"
+    assert automation.prompts == []
+    assert safe_agent.calls == ["create youtube account with dummy data"]
 
 
 @pytest.mark.asyncio

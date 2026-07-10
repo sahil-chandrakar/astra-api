@@ -66,6 +66,10 @@ class CommandService:
         if conversational:
             return conversational
 
+        if request.mode == "agents" and self._should_route_youtube_automation_first(text):
+            run = await self.automation_service.start_run(AutomationRunRequest(prompt=text))  # type: ignore[union-attr]
+            return self._automation_response(run)
+
         if request.mode == "agents" or self._looks_like_mock_test_intent(text):
             agent_response = await self.safe_agent.handle_natural_language(text, confirmed=request.confirmed)
             if agent_response and (request.mode == "agents" or agent_response.command_id in {"generate_mock_test", "open_latest_mock_test", "list_mock_tests"}):
@@ -95,6 +99,36 @@ class CommandService:
 
         chat_response = await self.agent_system.chat(text, "cockpit", astra_pro=request.astra_pro)
         return self._chat_response(chat_response, "cockpit", "chat")
+
+    def _should_route_youtube_automation_first(self, text: str) -> bool:
+        if not self.automation_service:
+            return False
+        normalized = self._normalize(text)
+        if not re.search(r"\b(youtube|you\s*tube|yt)\b", normalized):
+            return False
+        if self._is_youtube_account_or_form_intent(normalized):
+            return False
+        media_intent = re.search(
+            r"\b(search|find|play|watch|open\s+.*video|latest|newest|recent|popular|shorts?|live|stream|channel|video|song|title|name|filter|download)\b",
+            normalized,
+        )
+        if not media_intent:
+            return False
+        can_handle = getattr(self.automation_service, "can_handle_agent_prompt", None)
+        return bool(callable(can_handle) and can_handle(text))
+
+    def _is_youtube_account_or_form_intent(self, normalized: str) -> bool:
+        form_intent = re.search(r"\b(fill|complete|populate)\b", normalized) and re.search(r"\b(form|login|account|registration|signup)\b", normalized)
+        create_account_intent = re.search(
+            r"\b(sign\s*up|signup|create\s+(?:an\s+)?(?:\w+\s+){0,4}account|new\s+account|account\s+creation|register|registration)\b",
+            normalized,
+        )
+        login_intent = re.search(r"\b(login|log\s*in|sign\s*in|signin)\b", normalized)
+        media_intent = re.search(r"\b(search|find|play|watch|latest|newest|recent|popular|shorts?|live|stream|channel|video|song|title|name|filter|download)\b", normalized)
+        explicit_account_page = re.search(r"\b(login|sign\s*in|signin)\s+(?:page|form|screen|account)\b", normalized)
+        if form_intent or create_account_intent or explicit_account_page:
+            return True
+        return bool(login_intent and not media_intent)
 
     def _mode_switch_response(self, mode: AppMode) -> CommandResponse:
         label = "cockpit chat" if mode == "cockpit" else mode.replace("_", " ")
